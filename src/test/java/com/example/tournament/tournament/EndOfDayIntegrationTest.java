@@ -1,0 +1,146 @@
+package com.example.tournament.tournament;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+import com.example.tournament.support.IntegrationTestBase;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import org.junit.jupiter.api.Test;
+
+class EndOfDayIntegrationTest extends IntegrationTestBase {
+
+    private Map<String, Object> member(long userId) {
+        return jdbc.queryForMap("SELECT * FROM group_members WHERE user_id = ? ORDER BY id DESC LIMIT 1", userId);
+    }
+
+    @Test
+    void endOfDayRanksPaysTopTwoAndRefundsUnfilledGroups() throws Exception {
+        Tournament t = openTournament();
+        FullGroup g = fullGroup();
+        long tr = g.player("TR"), us = g.player("US"), gb = g.player("GB");
+        levelUp(us, 3);   // US reaches 3 first
+        levelUp(tr, 3);   // TR ties at 3, later
+        levelUp(gb, 1);
+
+        long waitingTr = newPlayer("TR");
+        long waitingUs = newPlayer("US");
+        join(waitingTr);
+        join(waitingUs);
+        assertThat(coins(waitingTr)).isEqualTo(4000);
+
+        clock.set(CLOSING_TIME);
+        assertThat(lifecycle.endOverdue(clock.instant())).isEqualTo(1);
+
+        assertThat(member(us)).containsEntry("final_rank", 1).containsEntry("reward_coins", 10_000);
+        assertThat(member(tr)).containsEntry("final_rank", 2).containsEntry("reward_coins", 5_000);
+        assertThat(member(gb)).containsEntry("final_rank", 3).containsEntry("reward_coins", 0);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM tournament_groups WHERE status <> 'ENDED'", Integer.class))
+                .isZero();
+        assertThat(jdbc.queryForObject("SELECT status FROM tournaments WHERE id = ?", String.class, t.getId()))
+                .isEqualTo("ENDED");
+
+        // Unfilled group: fee back, no rank, no reward.
+        assertThat(coins(waitingTr)).isEqualTo(5000);
+        assertThat(coins(waitingUs)).isEqualTo(5000);
+        assertThat(member(waitingTr)).containsEntry("final_rank", null).containsEntry("reward_coins", 0);
+
+        // Running the job again (say, on a second instance) changes nothing.
+        assertThat(lifecycle.endOverdue(clock.instant())).isZero();
+        assertThat(coins(waitingTr)).isEqualTo(5000);
+
+        // The final Redis boards match Postgres.
+        assertThat(redis.opsForZSet().score("lb:country:" + t.getId(), "US")).isEqualTo(3.0);
+        assertThat(body(groupBoard(g.groupId())).get(0).get("userId").asLong()).isEqualTo(us);
+    }
+
+    @Test
+    void levelUpsAfterTheEndDoNotScore() throws Exception {
+        openTournament();
+        FullGroup g = fullGroup();
+        long tr = g.player("TR");
+        levelUp(tr, 2);
+
+        // Past 20:00 but before the job ran: no points.
+        clock.set(CLOSING_TIME.plusMillis(1));
+        levelUp(tr).andExpect(status().isOk());
+        assertThat(score(tr)).isEqualTo(2);
+
+        lifecycle.endOverdue(clock.instant());
+        levelUp(tr).andExpect(status().isOk()).andExpect(jsonPath("$.level").value(24));
+        assertThat(score(tr)).isEqualTo(2);
+    }
+
+    @Test
+    void claimAddsTheRewardOnce() throws Exception {
+        openTournament();
+        FullGroup g = fullGroup();
+        long us = g.player("US");
+        levelUp(us, 1);
+        clock.set(CLOSING_TIME);
+        lifecycle.endOverdue(clock.instant());
+
+        long before = coins(us);
+        claim(us).andExpect(status().isOk()).andExpect(jsonPath("$.coins").value(before + 10_000));
+        claim(us).andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("NO_REWARD"));
+        claim(g.player("GB")).andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("NO_REWARD"));
+        claim(999_999).andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("USER_NOT_FOUND"));
+        assertThat(member(us)).containsEntry("reward_claimed", true);
+    }
+
+    @Test
+    void unclaimedRewardBlocksTomorrowUntilClaimed() throws Exception {
+        openTournament();
+        FullGroup g = fullGroup();
+        long winner = g.player("FR");
+        levelUp(winner, 1);
+        clock.set(CLOSING_TIME);
+        lifecycle.endOverdue(clock.instant());
+
+        clock.set(MORNING.plus(Duration.ofDays(1)));
+        join(winner).andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("UNCLAIMED_REWARD"));
+        join(g.player("DE")).andExpect(status().isCreated()); // no reward, free to join
+
+        claim(winner).andExpect(status().isOk());
+        join(winner).andExpect(status().isCreated());
+    }
+
+    @Test
+    void concurrentClaimsPayOnlyOnce() throws Exception {
+        openTournament();
+        FullGroup g = fullGroup();
+        long us = g.player("US");
+        levelUp(us, 1);
+        clock.set(CLOSING_TIME);
+        lifecycle.endOverdue(clock.instant());
+        long before = coins(us);
+
+        int threads = 10;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch go = new CountDownLatch(1);
+        List<Future<Integer>> statuses = new ArrayList<>();
+        for (int i = 0; i < threads; i++) {
+            statuses.add(pool.submit(() -> {
+                go.await();
+                return claim(us).andReturn().getResponse().getStatus();
+            }));
+        }
+        go.countDown();
+        List<Integer> codes = new ArrayList<>();
+        for (Future<Integer> f : statuses) {
+            codes.add(f.get());
+        }
+        pool.shutdown();
+
+        assertThat(codes).filteredOn(c -> c == 200).hasSize(1);
+        assertThat(codes).filteredOn(c -> c == 404).hasSize(threads - 1);
+        assertThat(coins(us)).isEqualTo(before + 10_000);
+    }
+}

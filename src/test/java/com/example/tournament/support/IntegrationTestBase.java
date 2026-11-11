@@ -1,0 +1,162 @@
+package com.example.tournament.support;
+
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+
+import com.example.tournament.TournamentApplication;
+import com.example.tournament.tournament.Tournament;
+import com.example.tournament.tournament.TournamentLifecycleService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.BeforeEach;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.data.redis.core.RedisCallback;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.ResultActions;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
+
+/**
+ * Real Postgres and Redis in containers, started once and shared by every test class.
+ * Scheduled jobs are off; tests move the clock and call the lifecycle service themselves.
+ */
+@SpringBootTest(classes = {TournamentApplication.class, TestClockConfig.class})
+@AutoConfigureMockMvc
+@TestPropertySource(properties = "game.jobs.enabled=false")
+public abstract class IntegrationTestBase {
+
+    @ServiceConnection
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @ServiceConnection(name = "redis")
+    static final GenericContainer<?> REDIS = new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
+
+    static {
+        POSTGRES.start();
+        REDIS.start();
+    }
+
+    /**
+     * 10:00 UTC today, inside the 00:00 to 20:00 window. Today and not a fixed date, because Redis
+     * expiry runs on the real clock: boards of a long-past tournament would expire immediately.
+     */
+    protected static final Instant MORNING = TestClockConfig.TODAY.atTime(10, 0).toInstant(ZoneOffset.UTC);
+    protected static final Instant CLOSING_TIME = TestClockConfig.TODAY.atTime(20, 0).toInstant(ZoneOffset.UTC);
+    protected static final List<String> COUNTRIES = List.of("TR", "US", "GB", "DE", "FR");
+
+    private static final AtomicInteger NAMES = new AtomicInteger();
+
+    @Autowired
+    protected MockMvc mvc;
+    @Autowired
+    protected ObjectMapper json;
+    @Autowired
+    protected JdbcTemplate jdbc;
+    @Autowired
+    protected StringRedisTemplate redis;
+    @Autowired
+    protected MutableClock clock;
+    @Autowired
+    protected TournamentLifecycleService lifecycle;
+
+    @BeforeEach
+    void resetState() {
+        jdbc.execute("TRUNCATE group_members, tournament_groups, tournaments, users");
+        flushRedis();
+        clock.set(MORNING);
+    }
+
+    protected void flushRedis() {
+        redis.execute((RedisCallback<Object>) c -> {
+            c.serverCommands().flushAll();
+            return null;
+        });
+    }
+
+    protected Tournament openTournament() {
+        return lifecycle.ensureTournamentFor(clock.instant());
+    }
+
+    /** A player who already meets the entry rules: level 20, 5,000 coins. */
+    protected long newPlayer(String country) {
+        return newPlayer(country, 20, 5000);
+    }
+
+    protected long newPlayer(String country, int level, long coins) {
+        return jdbc.queryForObject(
+                "INSERT INTO users (username, country, level, coins) VALUES (?, ?, ?, ?) RETURNING id",
+                Long.class, "player" + NAMES.incrementAndGet(), country, level, coins);
+    }
+
+    /** One player per country, joined in the order TR, US, GB, DE, FR, one second apart. */
+    protected FullGroup fullGroup() throws Exception {
+        List<Long> ids = new ArrayList<>();
+        long groupId = -1;
+        for (String country : COUNTRIES) {
+            long id = newPlayer(country);
+            ids.add(id);
+            groupId = body(join(id)).get("groupId").asLong();
+            clock.advance(Duration.ofSeconds(1));
+        }
+        return new FullGroup(groupId, ids);
+    }
+
+    public record FullGroup(long groupId, List<Long> playerIds) {
+        public long player(String country) {
+            return playerIds.get(COUNTRIES.indexOf(country));
+        }
+    }
+
+    protected long coins(long userId) {
+        return jdbc.queryForObject("SELECT coins FROM users WHERE id = ?", Long.class, userId);
+    }
+
+    protected int score(long userId) {
+        return jdbc.queryForObject("SELECT score FROM group_members WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+                Integer.class, userId);
+    }
+
+    protected ResultActions join(long userId) throws Exception {
+        return mvc.perform(post("/tournaments/current/entries")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"userId\":" + userId + "}"));
+    }
+
+    protected ResultActions levelUp(long userId) throws Exception {
+        return mvc.perform(post("/users/{id}/levels", userId));
+    }
+
+    protected ResultActions levelUp(long userId, int times) throws Exception {
+        ResultActions last = null;
+        for (int i = 0; i < times; i++) {
+            clock.advance(Duration.ofMillis(10));
+            last = levelUp(userId);
+        }
+        return last;
+    }
+
+    protected ResultActions claim(long userId) throws Exception {
+        return mvc.perform(post("/users/{id}/rewards/claim", userId));
+    }
+
+    protected ResultActions groupBoard(long groupId) throws Exception {
+        return mvc.perform(get("/groups/{id}/leaderboard", groupId));
+    }
+
+    protected JsonNode body(ResultActions result) throws Exception {
+        return json.readTree(result.andReturn().getResponse().getContentAsString());
+    }
+}

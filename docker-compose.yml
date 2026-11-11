@@ -1,0 +1,46 @@
+name: tournament-service
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: tournament
+      POSTGRES_USER: tournament
+      POSTGRES_PASSWORD: tournament
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"   # 5433 so it doesn't clash with a local Postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tournament -d tournament"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/tournament
+      REDIS_HOST: redis
+      # Set TOURNAMENT_CLOSES_AT=24h to play or load test after 20:00 UTC.
+      TOURNAMENT_CLOSES_AT: ${TOURNAMENT_CLOSES_AT:-20h}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:

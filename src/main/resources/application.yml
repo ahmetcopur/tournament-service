@@ -1,0 +1,58 @@
+spring:
+  application:
+    name: tournament-service
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/tournament}
+    username: ${DB_USER:tournament}
+    password: ${DB_PASSWORD:tournament}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: none   # Flyway owns the schema
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 500ms
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+
+# Game rules. Every value can be changed here (or with env vars) without code changes.
+game:
+  starting-coins: 5000
+  countries: [TR, US, GB, DE, FR]   # a group holds exactly one player from each
+  coins-per-level: 25
+  tournament:
+    opens-at: ${TOURNAMENT_OPENS_AT:0h}     # offset from 00:00 UTC
+    closes-at: ${TOURNAMENT_CLOSES_AT:20h}  # offset from 00:00 UTC, at most 24h
+    min-level: 20
+    entry-fee: 1000
+    rewards: [10000, 5000]                  # by final rank: 1st, 2nd, ...
+    open-cron: "0 0 0 * * *"                # keep in step with opens-at
+    close-cron: "0 0 20 * * *"              # keep in step with closes-at
+  leaderboard:
+    ttl-after-end: 2d
+  jobs:
+    enabled: true   # scheduled jobs and startup tasks; tests turn them off
+
+logging:
+  level:
+    org.hibernate.SQL: warn
