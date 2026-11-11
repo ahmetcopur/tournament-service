@@ -44,14 +44,19 @@ public class GroupMember {
     @Column(name = "reward_claimed", nullable = false)
     private boolean rewardClaimed;
 
+    /** What this player paid to enter; refunded as is if the group never fills. */
+    @Column(name = "entry_fee", nullable = false, updatable = false)
+    private long entryFee;
+
     protected GroupMember() {
     }
 
-    public GroupMember(long groupId, long tournamentId, long userId, String country, Instant joinedAt) {
+    public GroupMember(long groupId, long tournamentId, long userId, String country, long entryFee, Instant joinedAt) {
         this.groupId = groupId;
         this.tournamentId = tournamentId;
         this.userId = userId;
         this.country = country;
+        this.entryFee = entryFee;
         this.score = 0;
         this.scoreUpdatedAt = joinedAt;
     }
@@ -94,5 +99,9 @@ public class GroupMember {
 
     public boolean isRewardClaimed() {
         return rewardClaimed;
+    }
+
+    public long getEntryFee() {
+        return entryFee;
     }
 }

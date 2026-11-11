@@ -2,7 +2,6 @@ package com.example.tournament.leaderboard;
 
 import com.example.tournament.config.GameProperties;
 import com.example.tournament.leaderboard.LeaderboardEvents.GroupActivated;
-import com.example.tournament.leaderboard.LeaderboardEvents.Member;
 import com.example.tournament.leaderboard.LeaderboardEvents.ScoreChanged;
 import com.example.tournament.leaderboard.LeaderboardEvents.TournamentEnded;
 import com.example.tournament.tournament.GroupMember;
@@ -10,18 +9,18 @@ import com.example.tournament.tournament.GroupMemberRepository;
 import com.example.tournament.tournament.TournamentWindows;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.ZSetOperations.TypedTuple;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -34,11 +33,24 @@ import org.springframework.transaction.support.TransactionTemplate;
  * Applies committed changes to the Redis boards. Postgres stays the source of truth: a failed
  * Redis write is logged and counted, never surfaced to the player, and the boards can always be
  * rebuilt from group_members.
+ *
+ * <p>Every write is idempotent. Group boards keep each player's highest value (ZADD GT). The
+ * country board records the highest score it has counted per player and adds only the
+ * difference. Late, repeated or out-of-order updates, and rebuilds running alongside live
+ * traffic, can't count a point twice or lose one.
+ *
+ * <p>Each script touches one key, or keys sharing a hash tag, so this runs unchanged on a
+ * Redis Cluster. The tests run Redis in cluster mode, which rejects cross-slot commands.
  */
 @Component
 public class LeaderboardWriter {
 
     private static final Logger log = LoggerFactory.getLogger(LeaderboardWriter.class);
+    private static final int APPLY_BATCH = 500;
+    private static final Duration REBUILD_LOCK_TTL = Duration.ofSeconds(60);
+    private static final RedisScript<Long> RELEASE_LOCK = RedisScript.of(
+            "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
+            Long.class);
 
     private final StringRedisTemplate redis;
     private final GroupMemberRepository members;
@@ -46,10 +58,14 @@ public class LeaderboardWriter {
     private final GameProperties props;
     private final TransactionTemplate readTx;
     private final Counter failures;
-    private final RedisScript<Long> levelUpScript =
-            RedisScript.of(new ClassPathResource("redis/level_up.lua"), Long.class);
     private final RedisScript<Long> upsertGroupScript =
             RedisScript.of(new ClassPathResource("redis/upsert_group.lua"), Long.class);
+    private final RedisScript<Long> countryApplyScript =
+            RedisScript.of(new ClassPathResource("redis/country_apply.lua"), Long.class);
+
+    /** A player's absolute score on the country board. */
+    private record Contribution(long userId, String country, int score) {
+    }
 
     public LeaderboardWriter(StringRedisTemplate redis, GroupMemberRepository members, TournamentWindows windows,
                              GameProperties props, PlatformTransactionManager txManager, MeterRegistry meters) {
@@ -72,15 +88,17 @@ public class LeaderboardWriter {
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onGroupActivated(GroupActivated event) {
         guarded("group activation " + event.groupId(), () -> {
-            long expireAt = expireAt(event.tournamentEnd());
             List<String> args = new ArrayList<>();
-            args.add(Long.toString(expireAt));
-            for (Member m : event.members()) {
+            args.add(Long.toString(expireAt(event.tournamentEnd())));
+            for (LeaderboardEvents.Member m : event.members()) {
                 args.add(Long.toString(LeaderboardScore.encode(0, m.joinedAt(), event.tournamentStart())));
                 args.add(Long.toString(m.userId()));
             }
             redis.execute(upsertGroupScript, List.of(LeaderboardKeys.group(event.groupId())), args.toArray());
-            if (!Boolean.TRUE.equals(redis.hasKey(LeaderboardKeys.country(event.tournamentId())))) {
+
+            List<Contribution> zeros = event.members().stream()
+                    .map(m -> new Contribution(m.userId(), m.country(), 0)).toList();
+            if (!applyToCountryBoard(event.tournamentId(), event.tournamentEnd(), zeros, false)) {
                 rebuildCountryBoard(event.tournamentId());
             }
         });
@@ -90,23 +108,24 @@ public class LeaderboardWriter {
     public void onScoreChanged(ScoreChanged event) {
         guarded("score update for user " + event.userId(), () -> {
             long value = LeaderboardScore.encode(event.score(), event.reachedAt(), event.tournamentStart());
-            Long countryUpdated = redis.execute(levelUpScript,
-                    List.of(LeaderboardKeys.group(event.groupId()), LeaderboardKeys.country(event.tournamentId())),
-                    Long.toString(value), Long.toString(event.userId()), event.country(),
-                    Long.toString(expireAt(event.tournamentEnd())));
-            if (countryUpdated != null && countryUpdated == 0L) {
+            redis.execute(upsertGroupScript, List.of(LeaderboardKeys.group(event.groupId())),
+                    Long.toString(expireAt(event.tournamentEnd())), Long.toString(value),
+                    Long.toString(event.userId()));
+
+            Contribution c = new Contribution(event.userId(), event.country(), event.score());
+            if (!applyToCountryBoard(event.tournamentId(), event.tournamentEnd(), List.of(c), false)) {
                 rebuildCountryBoard(event.tournamentId());
             }
         });
     }
 
-    /** After 20:00 nothing changes any more, so the boards are rewritten with the exact final values. */
+    /** After 20:00 nothing changes any more; make sure every board holds the final values. */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onTournamentEnded(TournamentEnded event) {
         guarded("final rebuild of tournament " + event.tournamentId(), () -> rebuild(event.tournamentId()));
     }
 
-    /** Rebuilds every board of a tournament from Postgres. */
+    /** Rebuilds every board of a tournament from Postgres. Safe to run while live updates arrive. */
     public void rebuild(long tournamentId) {
         TournamentWindows.Window window = windows.of(tournamentId);
         List<GroupMember> started = readTx.execute(status -> members.findInStartedGroups(tournamentId));
@@ -117,10 +136,10 @@ public class LeaderboardWriter {
         log.info("Rebuilt leaderboards of tournament {} ({} groups)", tournamentId, byGroup.size());
     }
 
-    /** Used at startup: a missing country board means Redis was wiped, so rebuild everything. */
+    /** Used at startup: an incomplete country board means Redis lost data, so rebuild everything. */
     public void rebuildIfMissing(long tournamentId) {
         guarded("startup rebuild of tournament " + tournamentId, () -> {
-            if (!Boolean.TRUE.equals(redis.hasKey(LeaderboardKeys.country(tournamentId)))) {
+            if (!Boolean.TRUE.equals(redis.opsForHash().hasKey(LeaderboardKeys.countryApplied(tournamentId), "_ready"))) {
                 rebuild(tournamentId);
             }
         });
@@ -142,22 +161,49 @@ public class LeaderboardWriter {
         redis.execute(upsertGroupScript, List.of(LeaderboardKeys.group(groupId)), args.toArray());
     }
 
+    /** Returns true if the country board is complete, false if it needs a rebuild. */
+    private boolean applyToCountryBoard(long tournamentId, Instant tournamentEnd, List<Contribution> contributions,
+                                        boolean markComplete) {
+        List<String> args = new ArrayList<>(2 + 3 * contributions.size());
+        args.add(Long.toString(expireAt(tournamentEnd)));
+        args.add(markComplete ? "1" : "0");
+        for (Contribution c : contributions) {
+            args.add(Long.toString(c.userId()));
+            args.add(c.country());
+            args.add(Integer.toString(c.score()));
+        }
+        Long complete = redis.execute(countryApplyScript,
+                List.of(LeaderboardKeys.country(tournamentId), LeaderboardKeys.countryApplied(tournamentId)),
+                args.toArray());
+        return complete != null && complete == 1L;
+    }
+
     /**
-     * Country totals only ever grow through ZINCRBY, which can't be replayed safely, so a missing
-     * board is rewritten from Postgres sums. Increments in flight during a rebuild can be off by a
-     * few points until the final rewrite at 20:00.
+     * Replays every player's Postgres score into the country board, then marks it complete. Until
+     * then reads come from Postgres. Every update committed before the Postgres read is in the
+     * replay, and every later one applies itself after its own commit, so the result is exact.
+     * One rebuild per tournament at a time: if another instance holds the lock, this returns and
+     * leaves the work to it.
      */
     private void rebuildCountryBoard(long tournamentId) {
-        List<Object[]> totals = readTx.execute(status -> members.countryTotals(tournamentId));
-        if (totals == null || totals.isEmpty()) {
+        String lock = LeaderboardKeys.countryRebuildLock(tournamentId);
+        String token = UUID.randomUUID().toString();
+        if (!Boolean.TRUE.equals(redis.opsForValue().setIfAbsent(lock, token, REBUILD_LOCK_TTL))) {
             return;
         }
-        Set<TypedTuple<String>> tuples = totals.stream()
-                .map(row -> TypedTuple.of((String) row[0], ((Number) row[1]).doubleValue()))
-                .collect(Collectors.toSet());
-        String key = LeaderboardKeys.country(tournamentId);
-        redis.opsForZSet().add(key, tuples);
-        redis.expireAt(key, Instant.ofEpochSecond(expireAt(windows.of(tournamentId).endsAt())));
+        try {
+            Instant end = windows.of(tournamentId).endsAt();
+            List<Contribution> all = readTx.execute(status -> members.findInStartedGroups(tournamentId)).stream()
+                    .map(m -> new Contribution(m.getUserId(), m.getCountry(), m.getScore()))
+                    .toList();
+            for (int from = 0; from < all.size(); from += APPLY_BATCH) {
+                applyToCountryBoard(tournamentId, end, all.subList(from, Math.min(from + APPLY_BATCH, all.size())), false);
+            }
+            applyToCountryBoard(tournamentId, end, List.of(), true);
+            log.info("Rebuilt country board of tournament {} from {} players", tournamentId, all.size());
+        } finally {
+            redis.execute(RELEASE_LOCK, List.of(lock), token);
+        }
     }
 
     private long expireAt(Instant tournamentEnd) {

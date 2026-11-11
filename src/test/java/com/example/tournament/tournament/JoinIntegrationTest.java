@@ -95,8 +95,8 @@ class JoinIntegrationTest extends IntegrationTestBase {
                 "INSERT INTO tournament_groups (tournament_id, status, member_count) VALUES (?, 'ENDED', 5) RETURNING id",
                 Long.class, yesterday);
         jdbc.update("""
-                INSERT INTO group_members (group_id, tournament_id, user_id, country, score, final_rank, reward_coins)
-                VALUES (?, ?, ?, 'TR', 9, 1, 10000)""", group, yesterday, player);
+                INSERT INTO group_members (group_id, tournament_id, user_id, country, score, final_rank, reward_coins, entry_fee)
+                VALUES (?, ?, ?, 'TR', 9, 1, 10000, 1000)""", group, yesterday, player);
 
         join(player).andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("UNCLAIMED_REWARD"));

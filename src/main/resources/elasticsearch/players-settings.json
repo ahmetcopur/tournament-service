@@ -1,0 +1,33 @@
+{
+  "index": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0
+  },
+  "analysis": {
+    "normalizer": {
+      "lowercase": {
+        "type": "custom",
+        "filter": ["lowercase"]
+      }
+    },
+    "filter": {
+      "username_edge": {
+        "type": "edge_ngram",
+        "min_gram": 1,
+        "max_gram": 32
+      }
+    },
+    "analyzer": {
+      "username_prefix": {
+        "type": "custom",
+        "tokenizer": "keyword",
+        "filter": ["lowercase", "username_edge"]
+      },
+      "username_whole": {
+        "type": "custom",
+        "tokenizer": "keyword",
+        "filter": ["lowercase"]
+      }
+    }
+  }
+}

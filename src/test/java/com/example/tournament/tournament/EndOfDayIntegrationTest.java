@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.example.tournament.leaderboard.LeaderboardKeys;
 import com.example.tournament.support.IntegrationTestBase;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -57,8 +58,29 @@ class EndOfDayIntegrationTest extends IntegrationTestBase {
         assertThat(coins(waitingTr)).isEqualTo(5000);
 
         // The final Redis boards match Postgres.
-        assertThat(redis.opsForZSet().score("lb:country:" + t.getId(), "US")).isEqualTo(3.0);
+        assertThat(redis.opsForZSet().score(LeaderboardKeys.country(t.getId()), "US")).isEqualTo(3.0);
         assertThat(body(groupBoard(g.groupId())).get(0).get("userId").asLong()).isEqualTo(us);
+    }
+
+    @Test
+    void refundReturnsWhatEachPlayerPaidEvenIfTheFeeChanged() throws Exception {
+        openTournament();
+        long joinedToday = newPlayer("TR");
+        long joinedEarlier = newPlayer("US");
+        join(joinedToday);
+        join(joinedEarlier);
+        assertThat(member(joinedToday)).containsEntry("entry_fee", 1000L);
+
+        // As if this player had joined before a config change, when the fee was 1,500.
+        jdbc.update("UPDATE group_members SET entry_fee = 1500 WHERE user_id = ?", joinedEarlier);
+        jdbc.update("UPDATE users SET coins = coins - 500 WHERE id = ?", joinedEarlier);
+        assertThat(coins(joinedEarlier)).isEqualTo(3500);
+
+        clock.set(CLOSING_TIME);
+        lifecycle.endOverdue(clock.instant());
+
+        assertThat(coins(joinedToday)).isEqualTo(5000);
+        assertThat(coins(joinedEarlier)).isEqualTo(5000);
     }
 
     @Test

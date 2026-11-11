@@ -88,8 +88,8 @@ public class TournamentLifecycleService {
         for (int rank = 1; rank <= rewards.size(); rank++) {
             members.assignReward(tournamentId, rank, rewards.get(rank - 1));
         }
-        // 4. Groups that never filled up get their entry fee back and no reward.
-        int refunded = users.refundUnstartedEntries(tournamentId, props.tournament().entryFee());
+        // 4. Groups that never filled up get back what each player paid, and no reward.
+        int refunded = users.refundUnstartedEntries(tournamentId);
         events.publishEvent(new TournamentEnded(tournamentId));
         log.info("Ended tournament {}; refunded {} players in unfilled groups", tournamentId, refunded);
         return true;

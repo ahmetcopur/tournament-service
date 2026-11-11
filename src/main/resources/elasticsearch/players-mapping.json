@@ -1,0 +1,18 @@
+{
+  "dynamic": "strict",
+  "properties": {
+    "id": { "type": "long" },
+    "username": {
+      "type": "keyword",
+      "normalizer": "lowercase",
+      "fields": {
+        "prefix": {
+          "type": "text",
+          "analyzer": "username_prefix",
+          "search_analyzer": "username_whole"
+        }
+      }
+    },
+    "country": { "type": "keyword" }
+  }
+}

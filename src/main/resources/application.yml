@@ -18,6 +18,10 @@ spring:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
       timeout: 500ms
+  elasticsearch:
+    uris: ${ELASTICSEARCH_URIS:http://localhost:9200}
+    connection-timeout: 1s
+    socket-timeout: 3s
   jackson:
     serialization:
       write-dates-as-timestamps: false
@@ -50,6 +54,8 @@ game:
     close-cron: "0 0 20 * * *"              # keep in step with closes-at
   leaderboard:
     ttl-after-end: 2d
+  search:
+    reconcile-every: PT10M   # re-index players missing from Elasticsearch
   jobs:
     enabled: true   # scheduled jobs and startup tasks; tests turn them off
 

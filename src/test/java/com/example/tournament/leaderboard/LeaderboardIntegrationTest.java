@@ -92,8 +92,8 @@ class LeaderboardIntegrationTest extends IntegrationTestBase {
         countryBoard(t.getId())
                 .andExpect(jsonPath("$[0].country").value("DE"))
                 .andExpect(jsonPath("$[0].score").value(3));
-        assertThat(redis.opsForZSet().score("lb:country:" + t.getId(), "GB")).isEqualTo(1.0);
-        assertThat(redis.opsForZSet().score("lb:country:" + t.getId(), "TR")).isEqualTo(1.0);
+        assertThat(redis.opsForZSet().score(LeaderboardKeys.country(t.getId()), "GB")).isEqualTo(1.0);
+        assertThat(redis.opsForZSet().score(LeaderboardKeys.country(t.getId()), "TR")).isEqualTo(1.0);
     }
 
     @Test
@@ -107,7 +107,8 @@ class LeaderboardIntegrationTest extends IntegrationTestBase {
         long now = System.currentTimeMillis() / 1000;
         // TTLs are relative to the real clock, so compare absolute expiry times with some slack.
         assertThat(now + groupTtl).isBetween(expected - 5, expected + 5);
-        assertThat(now + redis.getExpire("lb:country:" + t.getId())).isBetween(expected - 5, expected + 5);
+        assertThat(now + redis.getExpire(LeaderboardKeys.country(t.getId()))).isBetween(expected - 5, expected + 5);
+        assertThat(now + redis.getExpire(LeaderboardKeys.countryApplied(t.getId()))).isBetween(expected - 5, expected + 5);
     }
 
     @Test
