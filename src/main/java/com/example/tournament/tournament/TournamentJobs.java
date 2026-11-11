@@ -6,6 +6,8 @@ import java.time.Instant;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -43,6 +45,7 @@ public class TournamentJobs {
      * overdue, and rebuild the Redis boards of open tournaments if Redis was wiped.
      */
     @EventListener(ApplicationReadyEvent.class)
+    @Order(Ordered.HIGHEST_PRECEDENCE) // before the search reconcile, which waits on Elasticsearch
     public void onStartup() {
         Instant now = time.now();
         lifecycle.ensureTournamentFor(now);

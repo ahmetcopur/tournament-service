@@ -35,6 +35,8 @@ management:
       exposure:
         include: health,info,metrics,prometheus
   metrics:
+    tags:
+      application: tournament-service
     distribution:
       percentiles-histogram:
         http.server.requests: true

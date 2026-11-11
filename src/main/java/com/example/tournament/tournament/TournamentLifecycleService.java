@@ -90,7 +90,7 @@ public class TournamentLifecycleService {
         }
         // 4. Groups that never filled up get back what each player paid, and no reward.
         int refunded = users.refundUnstartedEntries(tournamentId);
-        events.publishEvent(new TournamentEnded(tournamentId));
+        events.publishEvent(new TournamentEnded(tournamentId, refunded));
         log.info("Ended tournament {}; refunded {} players in unfilled groups", tournamentId, refunded);
         return true;
     }

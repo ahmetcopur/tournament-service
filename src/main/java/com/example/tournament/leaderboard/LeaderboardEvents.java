@@ -23,6 +23,6 @@ public final class LeaderboardEvents {
                                Instant reachedAt, Instant tournamentStart, Instant tournamentEnd) {
     }
 
-    public record TournamentEnded(long tournamentId) {
+    public record TournamentEnded(long tournamentId, int refundedPlayers) {
     }
 }

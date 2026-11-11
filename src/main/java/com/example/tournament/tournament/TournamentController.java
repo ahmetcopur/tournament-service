@@ -1,7 +1,5 @@
 package com.example.tournament.tournament;
 
-import com.example.tournament.common.ApiException;
-import com.example.tournament.common.ErrorCode;
 import com.example.tournament.config.TimeSource;
 import jakarta.validation.Valid;
 import java.time.Instant;
@@ -27,11 +25,15 @@ public class TournamentController {
         this.time = time;
     }
 
-    /** Not in the doc: clients need today's tournament id for the rank and country endpoints. */
+    /**
+     * Not in the doc: clients need today's tournament id for the rank and country endpoints.
+     * Creates today's row if neither the midnight job nor startup has yet (a fresh instance can
+     * report healthy before its startup tasks finish). The insert is idempotent.
+     */
     @GetMapping("/current")
     public TournamentResponse current() {
         Instant now = time.now();
-        Tournament t = lifecycle.todays(now).orElseThrow(() -> new ApiException(ErrorCode.TOURNAMENT_NOT_FOUND));
+        Tournament t = lifecycle.todays(now).orElseGet(() -> lifecycle.ensureTournamentFor(now));
         return new TournamentResponse(t.getId(), t.getStartsAt(), t.getEndsAt(), t.getStatus(), t.isOpenAt(now));
     }
 
