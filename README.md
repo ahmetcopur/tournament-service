@@ -110,11 +110,13 @@ the outer `UPDATE` adds the coins, so of two racing claims only one finds a row.
 player's group is `ACTIVE`, the group row share-locked. Redis is updated in an
 `@TransactionalEventListener(AFTER_COMMIT)`, so a rolled-back level up never shows on a board.
 
-**The 20:00 cutoff.** A request counts only if it is *processed* before 20:00, meaning it holds its
-locks before then, not merely arrived before then. Level ups read the clock after locking the
-player's row, and joins check the window again once they hold their locks. A request that arrived
-at 19:59:59.9 but waited on a lock past 20:00 scores nothing and can't join. Once the 20:00 job has
-ended a group, no point can land in it either, because scoring requires an `ACTIVE` group.
+**The 20:00 cutoff.** A request counts only if it is *processed* before 20:00, meaning it holds
+**all** its locks before then, not merely arrived before then. Scoring reads the clock after it holds
+both the player's row and the group's row. The time it reads is both the cutoff check and the
+tie-break time, and while it holds the group, the 20:00 job can't end it. Joins check the window
+again once they hold their locks. A request that arrived at 19:59:59.9 but waited on any lock past
+20:00 scores nothing and can't join. Once the 20:00 job has ended a group, no point can land in it
+either, because scoring requires an `ACTIVE` group.
 
 **End of day** ([TournamentLifecycleService](src/main/java/com/example/tournament/tournament/TournamentLifecycleService.java)).
 One transaction: mark the tournament `ENDED` (waits for in-flight joins), end every group (waits
@@ -144,7 +146,10 @@ or losing one.
   right after its commit, are covered by a full re-apply of every open tournament every 5 minutes
   (one instance does it, via a lock that expires). A timeout doesn't even mean the write was lost:
   it can land late, and the retry applying it again changes nothing.
-- At 20:00 and at startup, boards are rebuilt from Postgres.
+- At 20:00 and at startup, boards are rebuilt from Postgres. A successful final rebuild is recorded
+  in `tournaments.boards_finalized_at`. If it fails (Redis down at 20:00, or the instance dies), the
+  tournament stays unfinalized and the 5-minute job retries it until it succeeds, for as long as its
+  boards would still exist. Only those tournaments are retried, never the whole history.
 
 **Redis Cluster.** Every command touches one key, or keys sharing a hash tag: a tournament's
 country board `lb:country:{7}` and its bookkeeping `lb:country:{7}:applied` sit in one slot, so
@@ -255,8 +260,8 @@ Building the dashboard turned up three things:
 
 ## Correctness review
 
-An outside review raised four correctness concerns. Each one got a test first, run against the
-code as it was; all of them reproduced, and each fix makes its test pass.
+Two rounds of outside review raised six correctness concerns. Each one got a test first, run
+against the code as it was; all six reproduced, and each fix makes its test pass.
 
 | Finding | Reproduced as | Fix |
 |---|---|---|
@@ -264,6 +269,8 @@ code as it was; all of them reproduced, and each fix makes its test pass.
 | A Redis write that never arrives leaves a complete board stale | A group key of the wrong type makes the write fail: the board stays behind Postgres after Redis is healthy again | Failed groups are re-applied from Postgres every 5 s; all open tournaments are re-applied every 5 min for writes lost without an error |
 | The 20:00 cutoff used the arrival time | A level up and a join that arrive at 19:59:59.9 and wait on a row lock until 20:00:00.001: the level up scored, the join succeeded | The clock is read after the locks are held; joins re-check the window |
 | Search reconcile compared document counts | An orphaned document hid a missing player (equal counts, nothing done); a leftover document returned `realname` for the query `oldname` | Reconcile compares player by player in both directions; search drops hits Postgres disagrees with |
+| *Round 2:* the clock was read before the group lock | A transaction holds an active group's row (without ending it) from 19:59:59.9 until 20:00:00.001: the waiting level up scored with its old time | Scoring reads the clock after it holds both the player and the group row |
+| *Round 2:* a failed final rebuild was never retried | A silent loss before 20:00, then a final rebuild that Redis rejects: after Redis recovers, the safety net skipped the ENDED tournament and its board stayed stale | The final rebuild is recorded in `tournaments.boards_finalized_at` (V3); the 5-minute job retries unfinalized tournaments while their boards exist |
 
 Writing the cutoff test also showed that the join locked the player with `FOR UPDATE`, which
 blocks foreign-key checks from other transactions for no reason. It now uses `FOR NO KEY UPDATE`.
@@ -277,7 +284,7 @@ apply twice.
 ./mvnw test        # needs Docker for Testcontainers
 ```
 
-61 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
+63 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
 Postgres, Redis (in cluster mode) and Elasticsearch containers. CI (GitHub Actions) runs them on
 every pull request and checks that the Docker image builds.
 
@@ -288,7 +295,8 @@ every pull request and checks that the Docker image builds.
 - **Leaderboards:** order with tie-break, exact same-millisecond ties matching the final ranking,
   rank, country sums, Redis wipe recovery, key expiry.
 - **Redis repair:** writes that fail are re-applied from Postgres; writes that time out but land
-  late aren't counted twice; the periodic re-apply repairs updates Redis never heard about.
+  late aren't counted twice; the periodic re-apply repairs updates Redis never heard about, and
+  finishes a final rebuild that failed at 20:00.
 - **Country board exactness:** retried and out-of-order updates, late updates after a wipe, reads
   while another instance rebuilds, half a board evicted, no empty board at startup, and 600
   concurrent level ups with Redis wiped halfway (the board still equals the Postgres sums).
@@ -297,8 +305,9 @@ every pull request and checks that the Docker image builds.
 - **End of day:** ranks, rewards, refunds of the fee actually paid, idempotency, no points after
   20:00, claims (including 10 concurrent claims paying once), unclaimed reward blocking the next
   day.
-- **Cutoff:** a level up or join that waits on a row lock across 20:00 scores nothing and is
-  refused; a level up still waiting while the 20:00 job ranks leaves the ranking alone.
+- **Cutoff:** a level up or join that waits on the player's row across 20:00 scores nothing and
+  is refused; so does a level up waiting on its group's row; a level up still waiting while the
+  20:00 job ranks leaves the ranking alone.
 - **Search:** prefix, exact match first, typos, country filter, limit, fresh level from Postgres,
   reconcile of players missing from the index, orphaned and wrong documents, bad parameters.
 - **Concurrency:** 200 players joining at once. No group has two players from one country,

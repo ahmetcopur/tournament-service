@@ -49,6 +49,30 @@ class EndOfDayIntegrationTest extends IntegrationTestBase {
         assertThat(score(tr)).as("no point for a level up processed after 20:00").isEqualTo(1);
     }
 
+    /**
+     * Review finding (third review): the clock was read after the player lock but before the
+     * group lock. Something holding the group row without ending it (an admin query, a future
+     * feature) would let a level up that waited past 20:00 score with its pre-20:00 time.
+     */
+    @Test
+    void levelUpWaitingOnTheGroupLockAcrossTheCutoffScoresNothing() throws Exception {
+        openTournament();
+        FullGroup g = fullGroup();
+        long tr = g.player("TR");
+        levelUp(tr, 1);
+
+        clock.set(CLOSING_TIME.minusMillis(100));
+        Future<Integer> pending;
+        String lockGroup = "SELECT 1 FROM tournament_groups WHERE id = " + g.groupId() + " FOR NO KEY UPDATE";
+        try (AutoCloseable lock = holdLock(lockGroup)) {
+            pending = background.submit(() -> levelUp(tr).andReturn().getResponse().getStatus());
+            awaitBlockedOn("SELECT m.* FROM group_members");
+            clock.set(CLOSING_TIME.plusMillis(1)); // released after 20:00, group still ACTIVE
+        }
+        assertThat(pending.get(10, TimeUnit.SECONDS)).isEqualTo(200);
+        assertThat(score(tr)).as("no point for a level up that got its group lock after 20:00").isEqualTo(1);
+    }
+
     @Test
     void levelUpWaitingWhileTheTournamentEndsLeavesTheRankingAlone() throws Exception {
         openTournament();
@@ -121,6 +145,10 @@ class EndOfDayIntegrationTest extends IntegrationTestBase {
         assertThat(coins(waitingTr)).isEqualTo(5000);
         assertThat(coins(waitingUs)).isEqualTo(5000);
         assertThat(member(waitingTr)).containsEntry("final_rank", null).containsEntry("reward_coins", 0);
+
+        // The final board rebuild succeeded and was recorded, so nothing will retry it.
+        assertThat(jdbc.queryForObject("SELECT boards_finalized_at FROM tournaments WHERE id = ?", Object.class, t.getId()))
+                .isNotNull();
 
         // Running the job again (say, on a second instance) changes nothing.
         assertThat(lifecycle.endOverdue(clock.instant())).isZero();

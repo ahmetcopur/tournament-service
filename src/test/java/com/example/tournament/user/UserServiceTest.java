@@ -61,7 +61,7 @@ class UserServiceTest {
 
         InOrder order = inOrder(users, scoring);
         order.verify(users).levelUp(7L, 25L);
-        order.verify(scoring).recordLevelPassed(7L, NOW);
+        order.verify(scoring).recordLevelPassed(7L);
         order.verify(users).findById(7L);
     }
 

@@ -30,7 +30,15 @@ public class Tournament {
     @Column(nullable = false, length = 16)
     private Status status;
 
+    /** When the Redis boards were rebuilt from the final values; null until that succeeds. */
+    @Column(name = "boards_finalized_at")
+    private Instant boardsFinalizedAt;
+
     protected Tournament() {
+    }
+
+    public Instant getBoardsFinalizedAt() {
+        return boardsFinalizedAt;
     }
 
     public Long getId() {

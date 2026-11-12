@@ -40,6 +40,10 @@ class RedisRepairIntegrationTest extends IntegrationTestBase {
         return totals;
     }
 
+    private Object boardsFinalizedAt(long tournamentId) {
+        return jdbc.queryForObject("SELECT boards_finalized_at FROM tournaments WHERE id = ?", Object.class, tournamentId);
+    }
+
     private int redisGroupScore(long groupId, long userId) {
         Double value = redis.opsForZSet().score(LeaderboardKeys.group(groupId), Long.toString(userId));
         return value == null ? -1 : LeaderboardScore.decode(value);
@@ -98,6 +102,42 @@ class RedisRepairIntegrationTest extends IntegrationTestBase {
                 .containsEntry("US", 2L).containsEntry("TR", 2L);
     }
 
+    /**
+     * Review finding (third review): an update lost silently just before 20:00, then a final
+     * rebuild that fails because Redis is unhealthy. The tournament is ENDED by the time Redis
+     * recovers, so a safety net that only looks at open tournaments never repairs it.
+     */
+    @Test
+    void finishedTournamentWhoseFinalRebuildFailedIsRepairedLater() throws Exception {
+        Tournament t = openTournament();
+        FullGroup first = fullGroup();
+        FullGroup second = fullGroup();
+        long de = second.player("DE");
+        levelUp(de, 1);
+
+        // Lost silently just before 20:00: Postgres has two more points than Redis.
+        jdbc.update("UPDATE group_members SET score = score + 2 WHERE user_id = ?", de);
+
+        // Redis rejects the final rebuild: the first group's key has the wrong type, so the
+        // rebuild fails before it reaches the second group.
+        String firstKey = LeaderboardKeys.group(first.groupId());
+        redis.delete(firstKey);
+        redis.opsForValue().set(firstKey, "broken");
+        clock.set(CLOSING_TIME);
+        lifecycle.endOverdue(clock.instant());
+        assertThat(redisGroupScore(second.groupId(), de)).as("stale after the failed final rebuild").isEqualTo(1);
+        assertThat(boardsFinalizedAt(t.getId())).as("failure leaves the tournament unfinalized").isNull();
+
+        redis.delete(firstKey); // Redis is healthy again
+        assertThat(writer.reapplyTournaments()).as("the periodic safety net picks it up").isEqualTo(1);
+
+        assertThat(redisGroupScore(second.groupId(), de)).isEqualTo(3);
+        assertThat(leaderboards.groupLeaderboard(second.groupId()).get(0).score()).isEqualTo(3);
+        assertThat(redisCountryTotals(t.getId())).isEqualTo(postgresCountryTotals(t.getId()));
+        assertThat(boardsFinalizedAt(t.getId())).isNotNull();
+        assertThat(writer.reapplyTournaments()).as("finished tournaments are not rebuilt again").isZero();
+    }
+
     @Test
     void periodicReapplyRepairsUpdatesThatNeverReachedRedis() throws Exception {
         Tournament t = openTournament();
@@ -110,7 +150,7 @@ class RedisRepairIntegrationTest extends IntegrationTestBase {
         jdbc.update("UPDATE group_members SET score = score + 2 WHERE user_id = ?", de);
         assertThat(redisGroupScore(g.groupId(), de)).isEqualTo(1);
 
-        writer.reapplyOpenTournaments();
+        writer.reapplyTournaments();
 
         assertThat(redisGroupScore(g.groupId(), de)).isEqualTo(3);
         assertThat(redisCountryTotals(t.getId())).isEqualTo(postgresCountryTotals(t.getId()))

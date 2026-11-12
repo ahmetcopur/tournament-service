@@ -5,7 +5,6 @@ import com.example.tournament.common.ErrorCode;
 import com.example.tournament.config.GameProperties;
 import com.example.tournament.config.TimeSource;
 import com.example.tournament.tournament.ScoringService;
-import java.time.Instant;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -56,11 +55,9 @@ public class UserService {
         if (users.levelUp(id, props.coinsPerLevel()) == 0) {
             throw new ApiException(ErrorCode.USER_NOT_FOUND);
         }
-        // Read the clock only now that we hold the player's row. A level up that arrived at
-        // 19:59:59.9 but waited on a lock until after 20:00 is processed after the cutoff and
-        // must not score; this time is also the tie-break time, so it should be when it happened.
-        Instant now = time.now();
-        scoring.recordLevelPassed(id, now);
+        // Scoring reads the clock itself, after it also holds the group row: a level up that
+        // arrived at 19:59:59.9 but waited on a lock past 20:00 must not score.
+        scoring.recordLevelPassed(id);
         return users.findById(id).orElseThrow();
     }
 }

@@ -35,9 +35,9 @@ public class LeaderboardJobs {
     /** Writes lost without an error anyone saw (an instance died after commit): repaired within minutes. */
     @Scheduled(initialDelayString = "${game.leaderboard.reapply-every:PT5M}",
                fixedDelayString = "${game.leaderboard.reapply-every:PT5M}")
-    public void reapplyOpenTournaments() {
+    public void reapplyTournaments() {
         try {
-            writer.reapplyOpenTournaments();
+            writer.reapplyTournaments();
         } catch (RuntimeException ex) {
             log.warn("Leaderboard re-apply failed, will try again: {}", ex.getMessage());
         }
