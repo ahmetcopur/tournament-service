@@ -1,25 +1,45 @@
 # Tournament and Leaderboard Service
 
-Spring Boot backend for a match-3 game. Players pass levels to earn coins, join a daily
-tournament in groups of five (one player per country), and compete on live group and country
-leaderboards.
+A Spring Boot backend for a match-3 game. Players pass levels to earn coins, join a daily
+tournament in groups of five with one player per country, and compete on live group and country
+leaderboards kept in Redis, with Postgres as the source of truth.
+
+- When 200 players join at once, each is charged exactly once and no group gets two players from
+  the same country.
+- When one player sends 10 reward claims at once, the reward is paid once.
+- After each load test, every group board and the country board in Redis matched Postgres exactly.
+- Under 400 requests/s on a laptop, level ups took 1.5 ms at p50 and 8.0 ms at p99.
+- 81 tests run in CI against real Postgres, Redis in cluster mode and Elasticsearch.
 
 Java 21 · Spring Boot 3.5 · Spring Data JPA · PostgreSQL 16 · Redis 7 · Elasticsearch 8 · Flyway ·
 Docker Compose · JUnit 5 + Testcontainers · k6 · Actuator, Prometheus and Grafana
 
 ## Run it
 
-Everything in Docker:
-
 ```bash
 docker compose up --build
 ```
 
-The tournament window is 00:00 to 20:00 UTC. To try it after 20:00 UTC, stretch the window:
+Once the app logs `Started TournamentApplication`, try it from a second terminal over plain HTTP
+on this machine (needs `jq`). Sign up returns a token; every other request sends it.
 
 ```bash
-TOURNAMENT_CLOSES_AT=24h docker compose up --build
+API=http://localhost:8080
+ME=$(curl -s $API/users -H 'Content-Type: application/json' -d '{"username":"alice"}')
+ID=$(echo "$ME" | jq -r .id)
+AUTH="Authorization: Bearer $(echo "$ME" | jq -r .token)"
+# Joining needs level 20; every level up also pays 25 coins.
+for i in $(seq 19); do curl -s -o /dev/null -XPOST $API/users/$ID/levels -H "$AUTH"; done
+curl -s -XPOST $API/tournaments/current/entries -H "$AUTH" -H 'Content-Type: application/json' \
+  -d "{\"userId\":$ID}"
 ```
+
+The join returns your group, `WAITING` until one player from each of the five countries is in it,
+then `ACTIVE`; from then on every level up scores a point on the group and country leaderboards.
+The tournament runs from 00:00 to 20:00 UTC. To try it after 20:00 UTC, stretch the window:
+`TOURNAMENT_CLOSES_AT=24h docker compose up --build`.
+
+### HTTPS and local development
 
 Secrets come from a git-ignored `.env` file; [.env.example](.env.example) lists them with
 local-only defaults. Set real values anywhere other than a laptop, above all `AUTH_TOKEN_SECRET`.
@@ -40,22 +60,22 @@ deployment, don't publish those ports at all.
 | 5433 / 6379 | Postgres (5433 so it doesn't clash with a local one) / Redis | this machine only |
 
 Caddy signs its certificates with its own local CA. Take its root once, then call the API the
-way clients do, over HTTPS. Sign up returns a token; every other request sends it.
+way clients do, over HTTPS:
 
 ```bash
 mkdir -p certs && docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt certs/caddy-root.crt
-API="curl -s --cacert certs/caddy-root.crt https://localhost:8443"
-TOKEN=$($API/users -XPOST -H 'Content-Type: application/json' -d '{"username":"alice"}' | jq -r .token)
-$API/users/1/levels -XPOST -H "Authorization: Bearer $TOKEN"
-$API/tournaments/current -H "Authorization: Bearer $TOKEN"
-$API/tournaments/current/entries -XPOST -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -d '{"userId":1}'
+API=https://localhost:8443
+ME=$(curl -s --cacert certs/caddy-root.crt $API/users -H 'Content-Type: application/json' \
+  -d '{"username":"bob"}')
+curl -s --cacert certs/caddy-root.crt $API/users/$(echo "$ME" | jq -r .id) \
+  -H "Authorization: Bearer $(echo "$ME" | jq -r .token)"
 ```
 
-(Joining needs level 20, so level up 19 times first.) To reach it from other machines, give it a
-name they resolve and list it: `PUBLIC_HOSTS="localhost, tournament.example"`. Clients connecting
-by bare IP send no server name, so TLS needs a hostname. For a real domain, remove `local_certs`
-from the [Caddyfile](monitoring/caddy/Caddyfile) and Caddy fetches a public certificate.
+The calls in the tour above work the same way with `--cacert certs/caddy-root.crt`. To reach it
+from other machines, give it a name they resolve and list it:
+`PUBLIC_HOSTS="localhost, tournament.example"`. Clients connecting by bare IP send no server name,
+so TLS needs a hostname. For a real domain, remove `local_certs` from the
+[Caddyfile](monitoring/caddy/Caddyfile) and Caddy fetches a public certificate.
 
 From an IDE (JDK 21), start the backing services, take Elasticsearch's CA certificate out of
 its volume, and point the app at them:
@@ -84,8 +104,8 @@ very player; **player** means any valid token.
 | GET | `/groups/{groupId}/leaderboard` | | player | `[{userId, username, country, score}]` |
 | GET | `/tournaments/{id}/users/{userId}/rank` | | player | `{rank}` inside the user's group |
 | GET | `/tournaments/{id}/countries/leaderboard` | | player | `[{country, score}]` |
-| GET | `/tournaments/current` | | player | `{id, startsAt, endsAt, status, open}`; creates today's row if needed *(added)* |
-| GET | `/users/search?q=ahm&country=TR&limit=20` | | player | `[User]`, best match first *(added)* |
+| GET | `/tournaments/current` | | player | `{id, startsAt, endsAt, status, open}`; creates today's row if needed |
+| GET | `/users/search?q=ahm&country=TR&limit=20` | | player | `[User]`, best match first |
 
 | Code | HTTP | When |
 |---|---|---|
@@ -96,12 +116,12 @@ very player; **player** means any valid token.
 | `UNCLAIMED_REWARD` | 409 | A reward from an earlier tournament is still unclaimed |
 | `ALREADY_JOINED` | 409 | Already in today's tournament |
 | `NO_REWARD` | 404 | Nothing to claim |
-| `USERNAME_TAKEN` | 409 | *(added)* Username exists |
-| `UNAUTHORIZED` | 401 | *(added)* Missing, invalid or expired token |
-| `FORBIDDEN` | 403 | *(added)* Acting as another player (whether or not that id exists) |
-| `GROUP_NOT_FOUND`, `TOURNAMENT_NOT_FOUND`, `NOT_IN_TOURNAMENT` | 404 | *(added)* Unknown ids on leaderboard reads |
-| `VALIDATION_ERROR` | 400 | *(added)* Bad body, path or query |
-| `SEARCH_UNAVAILABLE` | 503 | *(added)* Elasticsearch can't be reached; everything else still works |
+| `USERNAME_TAKEN` | 409 | Username exists |
+| `UNAUTHORIZED` | 401 | Missing, invalid or expired token |
+| `FORBIDDEN` | 403 | Acting as another player (whether or not that id exists) |
+| `GROUP_NOT_FOUND`, `TOURNAMENT_NOT_FOUND`, `NOT_IN_TOURNAMENT` | 404 | Unknown ids on leaderboard reads |
+| `VALIDATION_ERROR` | 400 | Bad body, path or query |
+| `SEARCH_UNAVAILABLE` | 503 | Elasticsearch can't be reached; everything else still works |
 
 Metrics are at `GET /actuator/prometheus` on the management port (8081); see
 [Monitoring](#monitoring).
@@ -128,7 +148,9 @@ All in [application.yml](src/main/resources/application.yml) under `game.*`; no 
 
 ## How the hard parts work
 
-**Authentication** ([SecurityConfig](src/main/java/com/example/tournament/security/SecurityConfig.java)).
+Where this differs from the design doc and why, and the correctness review: [docs/DESIGN.md](docs/DESIGN.md).
+
+**Authentication** ([SecurityConfig](src/main/java/io/github/ahmetcopur/tournament/security/SecurityConfig.java)).
 Sign up returns a signed token (HS256, 30 days) whose subject is the user id. Spring Security's
 OAuth2 resource server checks signature, issuer and expiry on every request, statelessly. Player
 actions then check that the token's subject is the player in the path or body; another player's
@@ -136,7 +158,7 @@ id gets 403 whether or not it exists, so ids can't be probed. Operational endpoi
 on the management port, and refused on the public port even with a valid token. Moving to a real
 identity provider replaces one `JwtDecoder` bean.
 
-**Joining** ([JoinService](src/main/java/com/example/tournament/tournament/JoinService.java)).
+**Joining** ([JoinService](src/main/java/io/github/ahmetcopur/tournament/tournament/JoinService.java)).
 One Postgres transaction: share-lock the open tournament row, lock the player's row, run the entry
 checks, charge the fee with one conditional `UPDATE`, then find a group with
 `FOR UPDATE SKIP LOCKED`. Two same-country joins at the same moment skip each other's locked
@@ -159,7 +181,7 @@ again once they hold their locks. A request that arrived at 19:59:59.9 but waite
 20:00 scores nothing and can't join. Once the 20:00 job has ended a group, no point can land in it
 either, because scoring requires an `ACTIVE` group.
 
-**End of day** ([TournamentLifecycleService](src/main/java/com/example/tournament/tournament/TournamentLifecycleService.java)).
+**End of day** ([TournamentLifecycleService](src/main/java/io/github/ahmetcopur/tournament/tournament/TournamentLifecycleService.java)).
 One transaction: mark the tournament `ENDED` (waits for in-flight joins), end every group (waits
 for in-flight level ups), rank full groups by score then by who reached it first, pay ranks 1 and 2,
 and refund players whose group never filled exactly the fee each one paid (stored on the entry,
@@ -184,7 +206,7 @@ or losing one.
   committed before a page was read is in the replay, and every later one applies itself, so the
   board ends up exact. Rebuilds run one at a time per tournament (a Redis lock), and until a board
   is complete, reads come from Postgres.
-- *Country board layout* ([CountryBoardLayout](src/main/java/com/example/tournament/leaderboard/CountryBoardLayout.java)).
+- *Country board layout* ([CountryBoardLayout](src/main/java/io/github/ahmetcopur/tournament/leaderboard/CountryBoardLayout.java)).
   The board is split into 8 slices by user id, each with its own hash tag, so country traffic
   spreads over 8 Redis Cluster slots; reads add the slices up (and reuse the sum for a second).
   Within a slice, the per-player bookkeeping lives in hashes of about 100 players. Hashes that
@@ -214,7 +236,7 @@ script can update them atomically. Group boards and the 8 slices spread across n
 The tests run Redis in cluster mode, which rejects any cross-slot command, so the suite checks this
 on every run. Switching is configuration only: set `spring.data.redis.cluster.nodes`.
 
-**Player search** ([PlayerSearchService](src/main/java/com/example/tournament/search/PlayerSearchService.java)).
+**Player search** ([PlayerSearchService](src/main/java/io/github/ahmetcopur/tournament/search/PlayerSearchService.java)).
 Elasticsearch holds only what people search by (id, username, country), written once at sign up
 after the commit. Results rank the exact name first, then names starting with the query
 (edge n-grams), then names within a typo or two (fuzzy). Level and coins come fresh from Postgres
@@ -232,7 +254,7 @@ The app talks to Elasticsearch over TLS as `tournament_app`, a user that may onl
 **Ties.** A Redis sorted set holds one double per member, so score and time are packed into one
 value: `score × 10^9 + (10^9 − 1 − ms since tournament start)`. A higher score always wins, and
 with equal scores the earlier time wins
-([LeaderboardScore](src/main/java/com/example/tournament/leaderboard/LeaderboardScore.java)). Two
+([LeaderboardScore](src/main/java/io/github/ahmetcopur/tournament/leaderboard/LeaderboardScore.java)). Two
 players can still reach the same score in the same millisecond. Redis would order them by member
 string, so `"15"` before `"14"`. The ranking breaks such ties by the lower user id, and because a
 group board has only five entries, the read path re-sorts them the same way. The live board, the
@@ -279,66 +301,6 @@ Building the dashboard turned up three things:
   overloaded laptop backed up 128 requests waiting for a pool connection and timed out two Redis
   writes. Both failures were counted, Postgres stayed correct, and the next update for each
   player repaired the boards.
-
-## Where this differs from the design doc, and why
-
-1. **Re-check after the lock in matchmaking.** The candidate query's `NOT EXISTS` runs on a
-   snapshot taken *before* the row lock. If another join committed a player of my country into
-   that group in between, Postgres re-checks the group row's own columns but not the
-   `group_members` subquery. Once the lock is held, every earlier joiner of that group has
-   committed, so a fresh query sees them all; if my country is taken, that group is skipped.
-   Without this the `UNIQUE (group_id, country)` net would turn the race into a failed join.
-2. **Joins lock the player's row** (`FOR UPDATE`). Two joins from the same player then run one
-   after the other, and the checks return the right error code (`ALREADY_JOINED` rather than a
-   constraint error). The doc's conditional `UPDATE` is still what enforces the fee rule.
-3. **Joins share-lock the tournament row, and the 20:00 job updates it first.** Otherwise a join
-   that opens a new group at 19:59:59.999 could commit after the job listed the groups, leaving a
-   `WAITING` group whose fee is never refunded.
-4. **Level ups share-lock the group and check `ends_at`**, so no points land after 20:00 or after
-   the ranking has been read.
-5. **Tie-break in milliseconds, with `10^9 − 1 − ms`.** Seconds tie often, and Postgres stores
-   finer times, so the two orderings could disagree. With `10^9 − s`, a score reached at second 0
-   encodes as exactly `(score + 1) × 10^9` and decodes to the wrong score. Times are cut to
-   milliseconds before they're stored in either place.
-6. **Zero scores sort by join time.** Members enter Redis with the encoded join time instead of a
-   plain 0 (and `score_updated_at` starts at join time). Otherwise Redis would break zero-score
-   ties by user id and Postgres by time.
-7. **`ZADD GT` instead of plain `ZADD`.** After-commit listeners for two level ups run on
-   different request threads and can reach Redis out of order; `GT` never moves a player back.
-8. **Exact country board instead of plain `ZINCRBY`.** A `+1` can't be retried safely, so after
-   a wipe nothing could tell which in-flight increments a rebuild already held. The board now
-   tracks the score counted per player and applies absolute scores (see above). The key has a hash
-   tag, `lb:country:{tournamentId}`, so it shares a cluster slot with its bookkeeping hash.
-9. **After-commit reads reuse the request's connection.** At first the rebuild read used
-   `REQUIRES_NEW`. During an after-commit callback Spring still holds the request's connection, so
-   each request needed a second one. In the 200-thread test, all 20 pooled connections were held
-   by requests waiting for another, and joins timed out after 30 s. Propagation `REQUIRED` fixed it
-   ([LeaderboardWriter](src/main/java/com/example/tournament/leaderboard/LeaderboardWriter.java)).
-10. **The entry fee is stored per entry** (`group_members.entry_fee`, migration V2), so refunds
-    return what each player paid, not the fee configured at 20:00.
-11. **Small additions:** `GET /tournaments/current`, player search, the extra error codes above,
-    named constraints (mapped to error codes), and indexes for the level-up lookup, the
-    unclaimed-reward check and the end-of-day queries.
-
-## Correctness review
-
-Two rounds of outside review raised six correctness concerns. Each one got a test first, run
-against the code as it was; all six reproduced, and each fix makes its test pass.
-
-| Finding | Reproduced as | Fix |
-|---|---|---|
-| Exact ties ranked differently live and at 20:00 | Two players reach score 1 in the same ms: the board showed `[15, 14, …]`, the final ranking `[14, 15, …]`, so the one shown 1st got the 2nd-place reward | Postgres breaks exact ties by lower user id; the Redis read path re-sorts the five entries the same way; rank no longer uses `ZREVRANK` |
-| A Redis write that never arrives leaves a complete board stale | A group key of the wrong type makes the write fail: the board stays behind Postgres after Redis is healthy again | Failed groups are re-applied from Postgres every 5 s; all open tournaments are re-applied every 5 min for writes lost without an error |
-| The 20:00 cutoff used the arrival time | A level up and a join that arrive at 19:59:59.9 and wait on a row lock until 20:00:00.001: the level up scored, the join succeeded | The clock is read after the locks are held; joins re-check the window |
-| Search reconcile compared document counts | An orphaned document hid a missing player (equal counts, nothing done); a leftover document returned `realname` for the query `oldname` | Reconcile compares player by player in both directions; search drops hits Postgres disagrees with |
-| *Round 2:* the clock was read before the group lock | A transaction holds an active group's row (without ending it) from 19:59:59.9 until 20:00:00.001: the waiting level up scored with its old time | Scoring reads the clock after it holds both the player and the group row |
-| *Round 2:* a failed final rebuild was never retried | A silent loss before 20:00, then a final rebuild that Redis rejects: after Redis recovers, the safety net skipped the ENDED tournament and its board stayed stale | The final rebuild is recorded in `tournaments.boards_finalized_at` (V3); the 5-minute job retries unfinalized tournaments while their boards exist |
-
-Writing the cutoff test also showed that the join locked the player with `FOR UPDATE`, which
-blocks foreign-key checks from other transactions for no reason. It now uses `FOR NO KEY UPDATE`.
-The repair test showed that a Redis timeout doesn't mean the write was lost: with Redis frozen,
-the command sat in its socket buffer and ran on resume, which is why every write must stay safe to
-apply twice.
 
 ## Scaling and security
 
@@ -425,27 +387,26 @@ docker run --rm -i --network tournament-service_default -v "$PWD/load-test":/loa
   grafana/k6:latest run -e BASE_URL=http://app:8080 /load-test/k6.js
 ```
 
-The script signs up its players and sends each one's token. Results from 2026-11-12, on an Apple
-Silicon laptop: Docker Desktop with 8 CPUs and 4 GB, shared by the app, Postgres, Redis,
-Elasticsearch (with TLS) and k6. Hikari pool 20, default Tomcat settings, 400 requests/s for
-60 s. Every run had 0 failed requests, and afterwards the Redis country board, summed over its
-slices, matched the Postgres totals exactly.
+The script signs up its players and sends each one's token. Results from 2026-11-12 on an Apple M1
+laptop (8 cores, 8 GB) whose Docker Desktop VM (8 CPUs, 4 GB) also ran k6, each run on a fresh stack.
+Only the app, Postgres and Redis were running; Elasticsearch, Prometheus, Grafana and Caddy were stopped.
+Both runs sent their full rate with 0 failed requests, and afterwards every group board and the
+country board in Redis matched Postgres exactly. 1,000 requests/s is the highest rate tried that k6
+held without skipping a request; at 1,250 to 1,500 it fell behind during latency spikes.
 
-The laptop was busy (load average 6 to 9), and tail latency follows the machine more than the
-code. So the previous version (on `main`, without authentication, slices or checksums) and this
-one were run alternately, each on a fresh database:
+| 400 requests/s for 60 s | p50 | p90 | p99 |
+|---|---|---|---|
+| Level up | 1.5 ms | 2.2 ms | 8.0 ms |
+| Group leaderboard | 0.9 ms | 1.5 ms | 5.0 ms |
+| Rank | 0.8 ms | 1.3 ms | 3.8 ms |
+| Country leaderboard | 0.3 ms | 0.6 ms | 2.0 ms |
 
-| Level up | p50 | p99 |
-|---|---|---|
-| previous version, run 1 | 1.9 ms | 209 ms |
-| previous version, run 2 | 1.6 ms | 243 ms |
-| this version, run 1 | 2.2 ms | 168 ms |
-| this version, run 2 | 1.5 ms | 10 ms |
-
-Both ranges overlap: authentication and the sliced board cost nothing measurable. With the
-1-second cache, the country board's p50 stays at 0.3 to 0.5 ms despite its 8 slices. Running
-Prometheus and Grafana on the same 4 GB VM roughly doubles the tail (a third run with them up:
-p99 421 ms).
+| 1,000 requests/s for 30 s | p50 | p90 | p99 |
+|---|---|---|---|
+| Level up | 1.8 ms | 12.0 ms | 121.5 ms |
+| Group leaderboard | 1.1 ms | 8.2 ms | 133.2 ms |
+| Rank | 1.0 ms | 7.4 ms | 152.5 ms |
+| Country leaderboard | 0.4 ms | 3.1 ms | 87.1 ms |
 
 ## Known limits
 

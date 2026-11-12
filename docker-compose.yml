@@ -29,30 +29,37 @@ services:
       timeout: 3s
       retries: 30
 
-  # Creates the TLS certificates (before Elasticsearch starts) and the app's least-privilege
-  # user (once it is up), then exits. Re-running is harmless.
-  es-setup:
+  # Creates the TLS certificates before Elasticsearch starts, then exits. Re-running is harmless.
+  # Root, to make Elasticsearch's key readable by it alone and the CA key by root alone.
+  es-certs:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.18.8
     user: "0"
-    environment:
-      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-elastic-local-only}
-      ES_APP_PASSWORD: ${ES_APP_PASSWORD:-app-local-only}
     volumes:
       - escerts:/usr/share/elasticsearch/config/certs
       - es-ca:/ca-public
       - ./monitoring/elasticsearch/setup.sh:/setup.sh:ro
-    command: ["bash", "/setup.sh"]
-    healthcheck:
-      test: ["CMD-SHELL", "[ -f config/certs/elasticsearch/elasticsearch.crt ]"]
-      interval: 2s
-      timeout: 3s
-      retries: 60
+    command: ["bash", "/setup.sh", "certs"]
+
+  # Once Elasticsearch is healthy, creates the app's least-privilege user, then exits.
+  # Re-running is harmless. Sees only the CA certificate, like the app.
+  es-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.8
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-elastic-local-only}
+      ES_APP_PASSWORD: ${ES_APP_PASSWORD:-app-local-only}
+    volumes:
+      - es-ca:/ca-public:ro
+      - ./monitoring/elasticsearch/setup.sh:/setup.sh:ro
+    command: ["bash", "/setup.sh", "user"]
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.18.8
     depends_on:
-      es-setup:
-        condition: service_healthy
+      es-certs:
+        condition: service_completed_successfully
     environment:
       discovery.type: single-node
       ES_JAVA_OPTS: -Xms512m -Xmx512m

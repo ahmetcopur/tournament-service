@@ -22,7 +22,9 @@ export const options = {
       rate: RATE,
       timeUnit: '1s',
       duration: DURATION,
-      preAllocatedVUs: 50,
+      // All VUs start up front. Starting one mid-run takes long enough that k6 skips iterations
+      // during a short latency spike even when the server keeps up, so "skipped" would measure k6.
+      preAllocatedVUs: 400,
       maxVUs: 400,
     },
   },
