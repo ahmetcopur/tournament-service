@@ -30,6 +30,8 @@ server:
   shutdown: graceful
 
 management:
+  server:
+    port: ${MANAGEMENT_PORT:8081}   # actuator only here; keep this port internal
   endpoints:
     web:
       exposure:
@@ -40,6 +42,13 @@ management:
     distribution:
       percentiles-histogram:
         http.server.requests: true
+
+# Player tokens (HS256). Set AUTH_TOKEN_SECRET (32+ bytes) everywhere except a laptop; without it
+# the app signs with a random key that dies on restart.
+auth:
+  token-secret: ${AUTH_TOKEN_SECRET:}
+  token-ttl: 30d
+  issuer: tournament-service
 
 # Game rules. Every value can be changed here (or with env vars) without code changes.
 game:
@@ -54,6 +63,7 @@ game:
     rewards: [10000, 5000]                  # by final rank: 1st, 2nd, ...
     open-cron: "0 0 0 * * *"                # keep in step with opens-at
     close-cron: "0 0 20 * * *"              # keep in step with closes-at
+    reconcile-every: PT1M                   # settle anything overdue that a daily job missed
   leaderboard:
     ttl-after-end: 2d
     retry-every: PT5S     # re-apply groups whose Redis write failed

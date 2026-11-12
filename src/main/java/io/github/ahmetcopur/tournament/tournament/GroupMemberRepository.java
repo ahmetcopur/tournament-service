@@ -1,0 +1,123 @@
+package io.github.ahmetcopur.tournament.tournament;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+public interface GroupMemberRepository extends JpaRepository<GroupMember, Long> {
+
+    boolean existsByTournamentIdAndUserId(long tournamentId, long userId);
+
+    boolean existsByGroupIdAndCountry(long groupId, String country);
+
+    Optional<GroupMember> findByTournamentIdAndUserId(long tournamentId, long userId);
+
+    List<GroupMember> findByGroupIdOrderByIdAsc(long groupId);
+
+    @Query("""
+            select count(m) > 0 from GroupMember m
+            where m.userId = :userId and m.rewardCoins > 0 and m.rewardClaimed = false
+            """)
+    boolean hasUnclaimedReward(@Param("userId") long userId);
+
+    /**
+     * The one ranking order, shared with the 20:00 ranking and the Redis read path: score, then
+     * who got there first, then (same millisecond) the lower user id. Redis alone would break
+     * exact ties by member string, so LeaderboardService re-sorts ties the same way.
+     */
+    @Query("""
+            select m from GroupMember m where m.groupId = :groupId
+            order by m.score desc, m.scoreUpdatedAt asc nulls last, m.userId asc
+            """)
+    List<GroupMember> findRanked(@Param("groupId") long groupId);
+
+    /**
+     * One page of members of full groups, in member id order (keyset paging: pass the last id
+     * seen). Values, not entities, so a rebuild's memory stays at one page however big the
+     * tournament is.
+     */
+    @Query("""
+            select new io.github.ahmetcopur.tournament.tournament.MemberScore(
+                       m.id, m.groupId, m.userId, m.country, m.score, m.scoreUpdatedAt)
+            from GroupMember m, TournamentGroup g
+            where g.id = m.groupId and g.tournamentId = :tournamentId and g.startedAt is not null
+              and m.id > :afterId
+            order by m.id
+            """)
+    List<MemberScore> findStartedPage(@Param("tournamentId") long tournamentId, @Param("afterId") long afterId,
+                                      Pageable page);
+
+    /**
+     * Like {@link #findStartedPage} but only members whose score changed, or whose group filled,
+     * since {@code since}: what the periodic re-apply needs to send to Redis.
+     */
+    @Query("""
+            select new io.github.ahmetcopur.tournament.tournament.MemberScore(
+                       m.id, m.groupId, m.userId, m.country, m.score, m.scoreUpdatedAt)
+            from GroupMember m, TournamentGroup g
+            where g.id = m.groupId and g.tournamentId = :tournamentId and g.startedAt is not null
+              and m.id > :afterId and (m.scoreUpdatedAt >= :since or g.startedAt >= :since)
+            order by m.id
+            """)
+    List<MemberScore> findStartedChangedPage(@Param("tournamentId") long tournamentId, @Param("since") Instant since,
+                                             @Param("afterId") long afterId, Pageable page);
+
+    @Query("""
+            select m.country, sum(m.score) from GroupMember m
+            where m.tournamentId = :tournamentId and m.groupId in (
+                select g.id from TournamentGroup g where g.tournamentId = :tournamentId and g.startedAt is not null)
+            group by m.country
+            """)
+    List<Object[]> countryTotals(@Param("tournamentId") long tournamentId);
+
+    /**
+     * The user's membership in an ACTIVE group of a tournament that hasn't ended, with the
+     * group row share-locked until commit. The 20:00 job's UPDATE on the group waits for that
+     * lock, and once the group is ENDED this query finds nothing, so no point lands after ranking.
+     */
+    @Query(value = """
+            SELECT m.* FROM group_members m
+            JOIN tournament_groups g ON g.id = m.group_id
+            JOIN tournaments t ON t.id = m.tournament_id
+            WHERE m.user_id = :userId AND g.status = 'ACTIVE' AND t.ends_at > :now
+            ORDER BY m.tournament_id DESC
+            LIMIT 1
+            FOR SHARE OF g
+            """, nativeQuery = true)
+    Optional<GroupMember> findScoringMembershipForShare(@Param("userId") long userId, @Param("now") Instant now);
+
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query(value = """
+            UPDATE group_members SET score = score + 1, score_updated_at = :now
+            WHERE id = :id
+            """, nativeQuery = true)
+    int incrementScore(@Param("id") long id, @Param("now") Instant now);
+
+    /** Final ranks for every group that filled up: score, then who reached it first. */
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query(value = """
+            UPDATE group_members gm SET final_rank = ranked.rnk
+            FROM (
+                SELECT m.id, ROW_NUMBER() OVER (
+                           PARTITION BY m.group_id
+                           ORDER BY m.score DESC, m.score_updated_at ASC NULLS LAST, m.user_id ASC) AS rnk
+                FROM group_members m
+                JOIN tournament_groups g ON g.id = m.group_id
+                WHERE g.tournament_id = :tournamentId AND g.started_at IS NOT NULL
+            ) ranked
+            WHERE gm.id = ranked.id
+            """, nativeQuery = true)
+    int assignFinalRanks(@Param("tournamentId") long tournamentId);
+
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query(value = """
+            UPDATE group_members SET reward_coins = :coins
+            WHERE tournament_id = :tournamentId AND final_rank = :rank
+            """, nativeQuery = true)
+    int assignReward(@Param("tournamentId") long tournamentId, @Param("rank") int rank, @Param("coins") long coins);
+}

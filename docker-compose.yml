@@ -8,7 +8,8 @@ services:
       POSTGRES_USER: tournament
       POSTGRES_PASSWORD: tournament
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"   # 5433 so it doesn't clash with a local Postgres
+      # Published to this machine only (development credentials). In a real deployment, don't publish it.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"   # 5433 so it doesn't clash with a local Postgres
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -20,37 +21,91 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      # This machine only: Redis here has no password.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 3s
       retries: 30
 
-  elasticsearch:
+  # Creates the TLS certificates before Elasticsearch starts, then exits. Re-running is harmless.
+  # Root, to make Elasticsearch's key readable by it alone and the CA key by root alone.
+  es-certs:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.8
+    user: "0"
+    volumes:
+      - escerts:/usr/share/elasticsearch/config/certs
+      - es-ca:/ca-public
+      - ./monitoring/elasticsearch/setup.sh:/setup.sh:ro
+    command: ["bash", "/setup.sh", "certs"]
+
+  # Once Elasticsearch is healthy, creates the app's least-privilege user, then exits.
+  # Re-running is harmless. Sees only the CA certificate, like the app.
+  es-setup:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.18.8
     environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-elastic-local-only}
+      ES_APP_PASSWORD: ${ES_APP_PASSWORD:-app-local-only}
+    volumes:
+      - es-ca:/ca-public:ro
+      - ./monitoring/elasticsearch/setup.sh:/setup.sh:ro
+    command: ["bash", "/setup.sh", "user"]
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.8
+    depends_on:
+      es-certs:
+        condition: service_completed_successfully
+    environment:
       discovery.type: single-node
-      xpack.security.enabled: "false"   # local only; turn security on anywhere real
       ES_JAVA_OPTS: -Xms512m -Xmx512m
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-elastic-local-only}
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "true"
+      xpack.security.http.ssl.key: certs/elasticsearch/elasticsearch.key
+      xpack.security.http.ssl.certificate: certs/elasticsearch/elasticsearch.crt
+      xpack.security.http.ssl.certificate_authorities: certs/ca/ca.crt
+      xpack.security.transport.ssl.enabled: "true"
+      xpack.security.transport.ssl.key: certs/elasticsearch/elasticsearch.key
+      xpack.security.transport.ssl.certificate: certs/elasticsearch/elasticsearch.crt
+      xpack.security.transport.ssl.certificate_authorities: certs/ca/ca.crt
+      xpack.security.transport.ssl.verification_mode: certificate
+    volumes:
+      - escerts:/usr/share/elasticsearch/config/certs:ro
     ports:
-      - "${ELASTICSEARCH_PORT:-9200}:9200"
+      - "127.0.0.1:${ELASTICSEARCH_PORT:-9200}:9200"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs 'localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' || exit 1"]
+      test: ["CMD-SHELL", "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'"]
       interval: 5s
       timeout: 5s
-      retries: 30
+      retries: 60
 
   app:
     build: .
     environment:
       DB_URL: jdbc:postgresql://postgres:5432/tournament
       REDIS_HOST: redis
-      ELASTICSEARCH_URIS: http://elasticsearch:9200
+      # Signing key for player tokens (32+ bytes). Empty means a random key per start.
+      AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET:-}
+      # Elasticsearch over HTTPS, as the least-privilege user, trusting only our CA.
+      ELASTICSEARCH_URIS: https://elasticsearch:9200
+      SPRING_ELASTICSEARCH_USERNAME: tournament_app
+      SPRING_ELASTICSEARCH_PASSWORD: ${ES_APP_PASSWORD:-app-local-only}
+      SPRING_ELASTICSEARCH_RESTCLIENT_SSL_BUNDLE: elasticsearch
+      SPRING_SSL_BUNDLE_PEM_ELASTICSEARCH_TRUSTSTORE_CERTIFICATE: file:/certs/ca.crt
       # Set TOURNAMENT_CLOSES_AT=24h to play or load test after 20:00 UTC.
       TOURNAMENT_CLOSES_AT: ${TOURNAMENT_CLOSES_AT:-20h}
+    volumes:
+      - es-ca:/certs:ro   # only the CA certificate; no private keys
     ports:
-      - "${APP_PORT:-8080}:8080"
+      # Plain HTTP for local tools only. The network reaches the API through caddy, over HTTPS.
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+      # Actuator (health, metrics) is on 8081. Published to this machine only; never publicly.
+      - "127.0.0.1:${MANAGEMENT_PORT:-8081}:8081"
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,6 +113,21 @@ services:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
+      es-setup:
+        condition: service_completed_successfully
+
+  # The only public entry point: HTTPS, terminated here and proxied to the app.
+  caddy:
+    image: caddy:2.11.6-alpine
+    environment:
+      PUBLIC_HOSTS: ${PUBLIC_HOSTS:-localhost}
+    volumes:
+      - ./monitoring/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data   # keeps its local CA, so clients can keep trusting it
+    ports:
+      - "${HTTPS_PORT:-8443}:443"
+    depends_on:
+      - app
 
   prometheus:
     image: prom/prometheus:v3.15.1
@@ -67,7 +137,7 @@ services:
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"   # this machine only
     depends_on:
       - app
 
@@ -85,9 +155,12 @@ services:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"   # this machine only: anonymous viewing is on
     depends_on:
       - prometheus
 
 volumes:
   pgdata:
+  escerts:
+  es-ca:
+  caddy-data:
