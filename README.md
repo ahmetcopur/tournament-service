@@ -110,6 +110,12 @@ the outer `UPDATE` adds the coins, so of two racing claims only one finds a row.
 player's group is `ACTIVE`, the group row share-locked. Redis is updated in an
 `@TransactionalEventListener(AFTER_COMMIT)`, so a rolled-back level up never shows on a board.
 
+**The 20:00 cutoff.** A request counts only if it is *processed* before 20:00, meaning it holds its
+locks before then, not merely arrived before then. Level ups read the clock after locking the
+player's row, and joins check the window again once they hold their locks. A request that arrived
+at 19:59:59.9 but waited on a lock past 20:00 scores nothing and can't join. Once the 20:00 job has
+ended a group, no point can land in it either, because scoring requires an `ACTIVE` group.
+
 **End of day** ([TournamentLifecycleService](src/main/java/com/example/tournament/tournament/TournamentLifecycleService.java)).
 One transaction: mark the tournament `ENDED` (waits for in-flight joins), end every group (waits
 for in-flight level ups), rank full groups by score then by who reached it first, pay ranks 1 and 2,
@@ -132,6 +138,12 @@ or losing one.
   rebuild's Postgres read is in the replay, and every later one applies itself, so the board ends up
   exact. Rebuilds run one at a time per tournament (a Redis lock), and until a board is complete,
   reads come from Postgres.
+- *Missed writes.* Idempotency makes retries safe, but something has to retry. When a Redis write
+  fails after the commit, its group is remembered and re-applied from Postgres every 5 seconds
+  until it succeeds. Writes lost without anyone seeing an error, for example an instance dying
+  right after its commit, are covered by a full re-apply of every open tournament every 5 minutes
+  (one instance does it, via a lock that expires). A timeout doesn't even mean the write was lost:
+  it can land late, and the retry applying it again changes nothing.
 - At 20:00 and at startup, boards are rebuilt from Postgres.
 
 **Redis Cluster.** Every command touches one key, or keys sharing a hash tag: a tournament's
@@ -144,14 +156,20 @@ on every run. Switching is configuration only: set `spring.data.redis.cluster.no
 Elasticsearch holds only what people search by (id, username, country), written once at sign up
 after the commit. Results rank the exact name first, then names starting with the query
 (edge n-grams), then names within a typo or two (fuzzy). Level and coins come fresh from Postgres
-for the ids found, so level ups never touch Elasticsearch. A failed index write never fails a sign
-up. At startup and every 10 minutes, a reconcile job re-indexes from Postgres if the index has
-fewer players than the database. If Elasticsearch is down, only search returns 503.
+for the ids found, so level ups never touch Elasticsearch, and a hit is returned only if Postgres
+agrees on who the player is. A failed index write never fails a sign up. At startup and every
+10 minutes, a reconcile job makes the index match Postgres player by player, not by document count:
+it (re)indexes missing or wrong documents and deletes documents whose player doesn't exist. If
+Elasticsearch is down, only search returns 503.
 
 **Ties.** A Redis sorted set holds one double per member, so score and time are packed into one
 value: `score × 10^9 + (10^9 − 1 − ms since tournament start)`. A higher score always wins, and
-with equal scores the earlier time wins, matching the 20:00 ranking in Postgres
-([LeaderboardScore](src/main/java/com/example/tournament/leaderboard/LeaderboardScore.java)).
+with equal scores the earlier time wins
+([LeaderboardScore](src/main/java/com/example/tournament/leaderboard/LeaderboardScore.java)). Two
+players can still reach the same score in the same millisecond. Redis would order them by member
+string, so `"15"` before `"14"`. The ranking breaks such ties by the lower user id, and because a
+group board has only five entries, the read path re-sorts them the same way. The live board, the
+rank endpoint and the 20:00 ranking always agree.
 
 ## Monitoring
 
@@ -179,7 +197,10 @@ Metrics the app adds on top of Spring Boot's HTTP, JVM, pool and Redis client me
 | `game_groups{status}`, `game_players_waiting` | Groups and waiting players in open tournaments, refreshed every 10 s (never queried per scrape) |
 | `leaderboard_redis_write_failures_total` | Redis writes that failed after the Postgres commit |
 | `leaderboard_country_rebuilds_total` | Country boards rebuilt from Postgres: one per tournament start and per 20:00 is normal |
+| `leaderboard_redis_write_repairs_total` | Groups whose failed Redis write was re-applied from Postgres |
 | `search_index_failures_total` | Players not written to Elasticsearch (the reconcile job retries) |
+| `search_reconcile_fixes_total` | Documents the reconcile job (re)indexed or deleted |
+| `search_stale_hits_total` | Search hits dropped because Postgres disagreed on who the player is |
 
 Building the dashboard turned up three things:
 - **Startup race:** a fresh instance could report healthy while today's tournament row didn't
@@ -232,13 +253,31 @@ Building the dashboard turned up three things:
     named constraints (mapped to error codes), and indexes for the level-up lookup, the
     unclaimed-reward check and the end-of-day queries.
 
+## Correctness review
+
+An outside review raised four correctness concerns. Each one got a test first, run against the
+code as it was; all of them reproduced, and each fix makes its test pass.
+
+| Finding | Reproduced as | Fix |
+|---|---|---|
+| Exact ties ranked differently live and at 20:00 | Two players reach score 1 in the same ms: the board showed `[15, 14, …]`, the final ranking `[14, 15, …]`, so the one shown 1st got the 2nd-place reward | Postgres breaks exact ties by lower user id; the Redis read path re-sorts the five entries the same way; rank no longer uses `ZREVRANK` |
+| A Redis write that never arrives leaves a complete board stale | A group key of the wrong type makes the write fail: the board stays behind Postgres after Redis is healthy again | Failed groups are re-applied from Postgres every 5 s; all open tournaments are re-applied every 5 min for writes lost without an error |
+| The 20:00 cutoff used the arrival time | A level up and a join that arrive at 19:59:59.9 and wait on a row lock until 20:00:00.001: the level up scored, the join succeeded | The clock is read after the locks are held; joins re-check the window |
+| Search reconcile compared document counts | An orphaned document hid a missing player (equal counts, nothing done); a leftover document returned `realname` for the query `oldname` | Reconcile compares player by player in both directions; search drops hits Postgres disagrees with |
+
+Writing the cutoff test also showed that the join locked the player with `FOR UPDATE`, which
+blocks foreign-key checks from other transactions for no reason. It now uses `FOR NO KEY UPDATE`.
+The repair test showed that a Redis timeout doesn't mean the write was lost: with Redis frozen,
+the command sat in its socket buffer and ran on resume, which is why every write must stay safe to
+apply twice.
+
 ## Tests
 
 ```bash
 ./mvnw test        # needs Docker for Testcontainers
 ```
 
-52 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
+61 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
 Postgres, Redis (in cluster mode) and Elasticsearch containers. CI (GitHub Actions) runs them on
 every pull request and checks that the Docker image builds.
 
@@ -246,7 +285,10 @@ every pull request and checks that the Docker image builds.
 - **Joining:** each entry rule and error code, group fill to `ACTIVE`, same country going to
   another group, score counting only once the group is full, today's tournament existing on the
   first read.
-- **Leaderboards:** order with tie-break, rank, country sums, Redis wipe recovery, key expiry.
+- **Leaderboards:** order with tie-break, exact same-millisecond ties matching the final ranking,
+  rank, country sums, Redis wipe recovery, key expiry.
+- **Redis repair:** writes that fail are re-applied from Postgres; writes that time out but land
+  late aren't counted twice; the periodic re-apply repairs updates Redis never heard about.
 - **Country board exactness:** retried and out-of-order updates, late updates after a wipe, reads
   while another instance rebuilds, half a board evicted, no empty board at startup, and 600
   concurrent level ups with Redis wiped halfway (the board still equals the Postgres sums).
@@ -255,8 +297,10 @@ every pull request and checks that the Docker image builds.
 - **End of day:** ranks, rewards, refunds of the fee actually paid, idempotency, no points after
   20:00, claims (including 10 concurrent claims paying once), unclaimed reward blocking the next
   day.
+- **Cutoff:** a level up or join that waits on a row lock across 20:00 scores nothing and is
+  refused; a level up still waiting while the 20:00 job ranks leaves the ranking alone.
 - **Search:** prefix, exact match first, typos, country filter, limit, fresh level from Postgres,
-  reconcile of players missing from the index, bad parameters.
+  reconcile of players missing from the index, orphaned and wrong documents, bad parameters.
 - **Concurrency:** 200 players joining at once. No group has two players from one country,
   everyone was charged exactly once, group counts match members, and every `ACTIVE` group is in
   Redis. Also one player sending 20 joins at once: charged once.
@@ -302,6 +346,12 @@ p99 under 5 ms on every endpoint. The medians are stable; the tail is the laptop
 
 ## Known limits
 
+- **No authentication or authorization.** Any caller can level up, join or claim for any user id.
+  A real deployment needs player authentication (for example a signed token whose subject is the
+  user id, checked against the path) and admin-only access to operational endpoints.
+- **Repair and reconcile cost grows with the data.** The 5-minute re-apply and the search
+  reconcile both read every relevant row. Fine at this scale; at millions of players, re-apply
+  only recently changed scores and compare search batches by checksum.
 - **Rebuilds read a whole tournament at once.** A country board rebuild loads every player in a
   full group into memory and replays them in batches of 500. That's fine for tens of thousands of
   players; for millions, page through Postgres instead.

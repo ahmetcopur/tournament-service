@@ -7,6 +7,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.example.tournament.leaderboard.LeaderboardKeys;
 import com.example.tournament.support.IntegrationTestBase;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -14,12 +15,80 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 class EndOfDayIntegrationTest extends IntegrationTestBase {
 
     private Map<String, Object> member(long userId) {
         return jdbc.queryForMap("SELECT * FROM group_members WHERE user_id = ? ORDER BY id DESC LIMIT 1", userId);
+    }
+
+    private final ExecutorService background = Executors.newCachedThreadPool();
+
+    /*
+     * Review finding: the 20:00 cutoff. A request can arrive before 20:00 but wait on a row lock
+     * until after it. Rule: it counts only if it is processed (holds its locks) before 20:00.
+     */
+
+    @Test
+    void levelUpWaitingOnALockAcrossTheCutoffScoresNothing() throws Exception {
+        openTournament();
+        FullGroup g = fullGroup();
+        long tr = g.player("TR");
+        levelUp(tr, 1);
+
+        clock.set(CLOSING_TIME.minusMillis(100));
+        Future<Integer> pending;
+        try (AutoCloseable lock = holdLock("SELECT 1 FROM users WHERE id = " + tr + " FOR NO KEY UPDATE")) {
+            pending = background.submit(() -> levelUp(tr).andReturn().getResponse().getStatus());
+            awaitBlockedOn("UPDATE users SET level");
+            clock.set(CLOSING_TIME.plusMillis(1)); // the lock is released only after 20:00
+        }
+        assertThat(pending.get(10, TimeUnit.SECONDS)).isEqualTo(200);
+        assertThat(score(tr)).as("no point for a level up processed after 20:00").isEqualTo(1);
+    }
+
+    @Test
+    void levelUpWaitingWhileTheTournamentEndsLeavesTheRankingAlone() throws Exception {
+        openTournament();
+        FullGroup g = fullGroup();
+        long tr = g.player("TR"), us = g.player("US");
+        levelUp(us, 2);
+        levelUp(tr, 1);
+
+        clock.set(CLOSING_TIME.minusMillis(100));
+        Future<Integer> pending;
+        try (AutoCloseable lock = holdLock("SELECT 1 FROM users WHERE id = " + tr + " FOR NO KEY UPDATE")) {
+            pending = background.submit(() -> levelUp(tr).andReturn().getResponse().getStatus());
+            awaitBlockedOn("UPDATE users SET level");
+            clock.set(CLOSING_TIME);
+            // Ranks while the level up is still waiting. In the background with a timeout, so a
+            // lock cycle fails the test instead of hanging it.
+            Instant closing = clock.instant();
+            assertThat(background.submit(() -> lifecycle.endOverdue(closing)).get(10, TimeUnit.SECONDS)).isEqualTo(1);
+        }
+        assertThat(pending.get(10, TimeUnit.SECONDS)).isEqualTo(200);
+        assertThat(score(tr)).isEqualTo(1);
+        assertThat(member(us)).containsEntry("final_rank", 1);
+        assertThat(member(tr)).containsEntry("final_rank", 2);
+    }
+
+    @Test
+    void joinWaitingOnALockAcrossTheCutoffIsClosed() throws Exception {
+        openTournament();
+        long player = newPlayer("TR");
+
+        clock.set(CLOSING_TIME.minusMillis(100));
+        Future<Integer> pending;
+        try (AutoCloseable lock = holdLock("SELECT 1 FROM users WHERE id = " + player + " FOR NO KEY UPDATE")) {
+            pending = background.submit(() -> join(player).andReturn().getResponse().getStatus());
+            awaitBlockedOn("SELECT * FROM users WHERE id");
+            clock.set(CLOSING_TIME.plusMillis(1));
+        }
+        assertThat(pending.get(10, TimeUnit.SECONDS)).isEqualTo(409);
+        assertThat(coins(player)).isEqualTo(5000);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM group_members", Integer.class)).isZero();
     }
 
     @Test

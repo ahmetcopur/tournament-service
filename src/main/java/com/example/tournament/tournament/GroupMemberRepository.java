@@ -24,10 +24,14 @@ public interface GroupMemberRepository extends JpaRepository<GroupMember, Long> 
             """)
     boolean hasUnclaimedReward(@Param("userId") long userId);
 
-    /** Same order as the Redis board and the 20:00 ranking: score, then who got there first. */
+    /**
+     * The one ranking order, shared with the 20:00 ranking and the Redis read path: score, then
+     * who got there first, then (same millisecond) the lower user id. Redis alone would break
+     * exact ties by member string, so LeaderboardService re-sorts ties the same way.
+     */
     @Query("""
             select m from GroupMember m where m.groupId = :groupId
-            order by m.score desc, m.scoreUpdatedAt asc nulls last, m.id asc
+            order by m.score desc, m.scoreUpdatedAt asc nulls last, m.userId asc
             """)
     List<GroupMember> findRanked(@Param("groupId") long groupId);
 
@@ -76,7 +80,7 @@ public interface GroupMemberRepository extends JpaRepository<GroupMember, Long> 
             FROM (
                 SELECT m.id, ROW_NUMBER() OVER (
                            PARTITION BY m.group_id
-                           ORDER BY m.score DESC, m.score_updated_at ASC NULLS LAST, m.id ASC) AS rnk
+                           ORDER BY m.score DESC, m.score_updated_at ASC NULLS LAST, m.user_id ASC) AS rnk
                 FROM group_members m
                 JOIN tournament_groups g ON g.id = m.group_id
                 WHERE g.tournament_id = :tournamentId AND g.started_at IS NOT NULL

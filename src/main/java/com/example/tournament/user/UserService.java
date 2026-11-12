@@ -53,10 +53,13 @@ public class UserService {
      */
     @Transactional
     public User levelUp(long id) {
-        Instant now = time.now();
         if (users.levelUp(id, props.coinsPerLevel()) == 0) {
             throw new ApiException(ErrorCode.USER_NOT_FOUND);
         }
+        // Read the clock only now that we hold the player's row. A level up that arrived at
+        // 19:59:59.9 but waited on a lock until after 20:00 is processed after the cutoff and
+        // must not score; this time is also the tie-break time, so it should be when it happened.
+        Instant now = time.now();
         scoring.recordLevelPassed(id, now);
         return users.findById(id).orElseThrow();
     }

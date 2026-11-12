@@ -54,14 +54,21 @@ public class JoinService {
 
     @Transactional
     public JoinResponse join(long userId) {
-        Instant now = time.now();
         GameProperties.TournamentRules rules = props.tournament();
 
-        Tournament tournament = openTournament(now);
+        Tournament tournament = openTournament(time.now());
 
         // Lock the player's row first: two joins by the same player now run one after the other,
         // and the checks below read committed data instead of a stale snapshot.
         User user = users.findByIdForUpdate(userId).orElseThrow(() -> new ApiException(ErrorCode.USER_NOT_FOUND));
+
+        // Check the window again now that we hold our locks: a join that arrived at 19:59:59.9 but
+        // waited on the player's row until after 20:00 is too late. (The tournament row is
+        // share-locked, so its status can't change under us; only the clock can.)
+        Instant now = time.now();
+        if (!tournament.isOpenAt(now)) {
+            throw new ApiException(ErrorCode.TOURNAMENT_CLOSED);
+        }
         if (members.existsByTournamentIdAndUserId(tournament.getId(), userId)) {
             throw new ApiException(ErrorCode.ALREADY_JOINED);
         }

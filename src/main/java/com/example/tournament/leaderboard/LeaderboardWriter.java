@@ -6,6 +6,8 @@ import com.example.tournament.leaderboard.LeaderboardEvents.ScoreChanged;
 import com.example.tournament.leaderboard.LeaderboardEvents.TournamentEnded;
 import com.example.tournament.tournament.GroupMember;
 import com.example.tournament.tournament.GroupMemberRepository;
+import com.example.tournament.tournament.Tournament;
+import com.example.tournament.tournament.TournamentRepository;
 import com.example.tournament.tournament.TournamentWindows;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -16,6 +18,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -48,17 +52,24 @@ public class LeaderboardWriter {
     private static final Logger log = LoggerFactory.getLogger(LeaderboardWriter.class);
     private static final int APPLY_BATCH = 500;
     private static final Duration REBUILD_LOCK_TTL = Duration.ofSeconds(60);
+    /** Shorter than the re-apply interval, so each interval exactly one instance does the work. */
+    private static final Duration REAPPLY_LOCK_TTL = Duration.ofMinutes(4);
+    private static final int MAX_MISSED_GROUPS = 10_000;
     private static final RedisScript<Long> RELEASE_LOCK = RedisScript.of(
             "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0",
             Long.class);
 
     private final StringRedisTemplate redis;
     private final GroupMemberRepository members;
+    private final TournamentRepository tournaments;
     private final TournamentWindows windows;
     private final GameProperties props;
     private final TransactionTemplate readTx;
     private final Counter failures;
+    private final Counter repairs;
     private final Counter countryRebuilds;
+    /** Groups whose Redis write failed after commit (group id -> tournament id), retried from Postgres. */
+    private final ConcurrentMap<Long, Long> missedGroups = new ConcurrentHashMap<>();
     private final RedisScript<Long> upsertGroupScript =
             RedisScript.of(new ClassPathResource("redis/upsert_group.lua"), Long.class);
     private final RedisScript<Long> countryApplyScript =
@@ -68,10 +79,12 @@ public class LeaderboardWriter {
     private record Contribution(long userId, String country, int score) {
     }
 
-    public LeaderboardWriter(StringRedisTemplate redis, GroupMemberRepository members, TournamentWindows windows,
-                             GameProperties props, PlatformTransactionManager txManager, MeterRegistry meters) {
+    public LeaderboardWriter(StringRedisTemplate redis, GroupMemberRepository members, TournamentRepository tournaments,
+                             TournamentWindows windows, GameProperties props, PlatformTransactionManager txManager,
+                             MeterRegistry meters) {
         this.redis = redis;
         this.members = members;
+        this.tournaments = tournaments;
         this.windows = windows;
         this.props = props;
         // REQUIRED on purpose. In an after-commit listener the request's connection is still held until
@@ -83,6 +96,9 @@ public class LeaderboardWriter {
         this.readTx.setReadOnly(true);
         this.failures = Counter.builder("leaderboard.redis.write.failures")
                 .description("Redis leaderboard writes that failed after the Postgres commit")
+                .register(meters);
+        this.repairs = Counter.builder("leaderboard.redis.write.repairs")
+                .description("Groups whose failed Redis write was re-applied from Postgres")
                 .register(meters);
         this.countryRebuilds = Counter.builder("leaderboard.country.rebuilds")
                 .description("Country boards rebuilt from Postgres (start of a tournament, Redis data loss, 20:00)")
@@ -105,7 +121,7 @@ public class LeaderboardWriter {
             if (!applyToCountryBoard(event.tournamentId(), event.tournamentEnd(), zeros, false)) {
                 rebuildCountryBoard(event.tournamentId());
             }
-        });
+        }, () -> rememberMissed(event.groupId(), event.tournamentId()));
     }
 
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
@@ -120,7 +136,83 @@ public class LeaderboardWriter {
             if (!applyToCountryBoard(event.tournamentId(), event.tournamentEnd(), List.of(c), false)) {
                 rebuildCountryBoard(event.tournamentId());
             }
-        });
+        }, () -> rememberMissed(event.groupId(), event.tournamentId()));
+    }
+
+    /**
+     * Re-applies, from Postgres, every group whose Redis write failed after its commit. Runs every
+     * few seconds; stops at the first failure (Redis is probably still down) and tries again later.
+     * Returns the number of groups repaired.
+     */
+    public int retryMissedWrites() {
+        int repaired = 0;
+        for (Map.Entry<Long, Long> missed : List.copyOf(missedGroups.entrySet())) {
+            long groupId = missed.getKey();
+            long tournamentId = missed.getValue();
+            try {
+                TournamentWindows.Window window = windows.of(tournamentId);
+                List<GroupMember> groupMembers = readTx.execute(status -> members.findRanked(groupId));
+                upsertGroup(groupId, groupMembers, window);
+                if (!applyToCountryBoard(tournamentId, window.endsAt(), contributions(groupMembers), false)) {
+                    rebuildCountryBoard(tournamentId);
+                }
+            } catch (RuntimeException ex) {
+                log.debug("Retry of group {} failed, will try again: {}", groupId, ex.getMessage());
+                break;
+            }
+            missedGroups.remove(groupId, tournamentId);
+            repairs.increment();
+            repaired++;
+        }
+        if (repaired > 0) {
+            log.info("Repaired {} leaderboard groups whose Redis write had failed", repaired);
+        }
+        return repaired;
+    }
+
+    /**
+     * Safety net for writes lost without anyone seeing an error, e.g. an instance that died
+     * between its Postgres commit and its Redis write: re-applies every scoring player of each
+     * open tournament from Postgres. Idempotent, so it runs alongside live traffic; a Redis lock
+     * that simply expires makes one instance per interval do it. Returns tournaments re-applied.
+     */
+    public int reapplyOpenTournaments() {
+        int done = 0;
+        for (Tournament t : tournaments.findByStatus(Tournament.Status.ACTIVE)) {
+            String lock = LeaderboardKeys.reapplyLock(t.getId());
+            if (!Boolean.TRUE.equals(redis.opsForValue().setIfAbsent(lock, "1", REAPPLY_LOCK_TTL))) {
+                continue;
+            }
+            TournamentWindows.Window window = windows.of(t.getId());
+            List<GroupMember> started = readTx.execute(status -> members.findInStartedGroups(t.getId()));
+            started.stream()
+                    .collect(Collectors.groupingBy(GroupMember::getGroupId, LinkedHashMap::new, Collectors.toList()))
+                    .forEach((groupId, groupMembers) -> upsertGroup(groupId, groupMembers, window));
+            boolean complete = true;
+            List<Contribution> all = contributions(started);
+            for (int from = 0; from < all.size(); from += APPLY_BATCH) {
+                complete &= applyToCountryBoard(t.getId(), window.endsAt(),
+                        all.subList(from, Math.min(from + APPLY_BATCH, all.size())), false);
+            }
+            if (!all.isEmpty() && !complete) {
+                rebuildCountryBoard(t.getId());
+            }
+            done++;
+        }
+        return done;
+    }
+
+    private void rememberMissed(long groupId, long tournamentId) {
+        // Past the cap Redis has been down for a while; the periodic re-apply covers everything.
+        if (missedGroups.size() < MAX_MISSED_GROUPS) {
+            missedGroups.put(groupId, tournamentId);
+        }
+    }
+
+    private static List<Contribution> contributions(List<GroupMember> groupMembers) {
+        return groupMembers.stream()
+                .map(m -> new Contribution(m.getUserId(), m.getCountry(), m.getScore()))
+                .toList();
     }
 
     /** After 20:00 nothing changes any more; make sure every board holds the final values. */
@@ -197,9 +289,7 @@ public class LeaderboardWriter {
         }
         try {
             Instant end = windows.of(tournamentId).endsAt();
-            List<Contribution> all = readTx.execute(status -> members.findInStartedGroups(tournamentId)).stream()
-                    .map(m -> new Contribution(m.getUserId(), m.getCountry(), m.getScore()))
-                    .toList();
+            List<Contribution> all = contributions(readTx.execute(status -> members.findInStartedGroups(tournamentId)));
             if (all.isEmpty()) {
                 // No full group yet, so no board. Marking an empty board complete would only be
                 // thrown away by the first group's update (it finds the totals key missing).
@@ -221,11 +311,17 @@ public class LeaderboardWriter {
     }
 
     private void guarded(String what, Runnable action) {
+        guarded(what, action, () -> { });
+    }
+
+    private void guarded(String what, Runnable action, Runnable onFailure) {
         try {
             action.run();
         } catch (RuntimeException ex) {
             failures.increment();
-            log.warn("Redis leaderboard write failed ({}); Postgres is unaffected", what, ex);
+            onFailure.run();
+            log.warn("Redis leaderboard write failed ({}); Postgres is unaffected, will retry from it: {}",
+                    what, ex.getMessage());
         }
     }
 }
