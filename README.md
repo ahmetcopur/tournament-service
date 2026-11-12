@@ -24,13 +24,17 @@ TOURNAMENT_CLOSES_AT=24h docker compose up --build
 Secrets come from a git-ignored `.env` file; [.env.example](.env.example) lists them with
 local-only defaults. Set real values anywhere other than a laptop, above all `AUTH_TOKEN_SECRET`.
 
+Only the API is published to the network. Everything else is bound to `127.0.0.1`, because in
+Compose Postgres uses development credentials, Redis has no password, and Grafana allows anonymous
+viewing. In a real deployment, don't publish those ports at all.
+
 | Port | What | Reachable from |
 |---|---|---|
-| 8080 | The API | anywhere |
-| 8081 | Actuator: health, metrics, Prometheus | this machine only (`127.0.0.1`); keep it internal |
-| 3000 / 9090 | Grafana dashboard (home page; `admin`/`admin` edits) / Prometheus | anywhere |
+| 8080 | The API (every call but sign up needs a token) | the network |
+| 8081 | Actuator: health, metrics, Prometheus | this machine only |
+| 3000 / 9090 | Grafana dashboard (home page; `admin`/`admin` edits) / Prometheus | this machine only |
 | 9200 | Elasticsearch, HTTPS with a password | this machine only |
-| 5433 | Postgres (5433 so it doesn't clash with a local one) | anywhere |
+| 5433 / 6379 | Postgres (5433 so it doesn't clash with a local one) / Redis | this machine only |
 
 A quick tour. Sign up returns a token; every other request sends it.
 
@@ -332,6 +336,7 @@ The known limits from the previous version, and what closed each one:
 | One hot country key | 8 slices with their own hash tags, summed on read (cached 1 s) | Five players land in five slices; the API total equals Postgres |
 | Bookkeeping ~50 B/player, kept 2 days | 100-player hashes in compact encoding, deleted when final | 6.8 vs 48.3 bytes per player; 0 after 20:00 |
 | Elasticsearch security off | TLS with its own CA, a password, and a least-privilege app user | Against Compose: plain HTTP refused; no credentials 401; the app user gets 403 on other indices |
+| Internal ports open to the network | Postgres, Redis, Prometheus, Grafana, Elasticsearch and actuator bound to `127.0.0.1` | From the machine's network address only 8080 answers; the rest are unreachable |
 
 ## Tests
 
@@ -412,16 +417,30 @@ p99 421 ms).
 
 ## Known limits
 
-- **Tokens can't be revoked or refreshed.** They are stateless and live 30 days; there is no
-  password, so a lost token means a lost account. A real game would use an identity provider
-  (Sign in with Apple/Google, a device account) and short tokens; that swaps the `JwtDecoder`.
+These are fine for a demo and must be decided before real players use it.
+
+- **Level-ups are trusted.** Authentication stops a player from acting for someone else, but
+  `POST /users/{id}/levels` (no body, as the design doc specifies) still grants a level whenever a
+  player calls it. Nothing proves a match-3 level was actually completed, so a player can script
+  coins and tournament points. Real anti-cheat needs the game in the loop: the server issues a
+  level attempt, the client returns the moves (or a signed result), and the server checks them and
+  rejects replays. A per-player rate limit would only cap the damage.
+- **No account recovery.** Tokens are stateless, can't be revoked or refreshed, and live 30 days.
+  There is no password or other login, so a lost or expired token means a lost account. A real game
+  would use an identity provider (Sign in with Apple/Google, a device account) and short-lived
+  tokens; that swaps the `JwtDecoder`.
 - **One shared signing key.** HS256 means every instance holds the key that issues tokens. With an
   identity provider, use its public keys (RS256/ES256) so the API can only verify.
 - **Redis must not evict** (`maxmemory-policy noeviction`, the default). Losing a slice's totals or
   metadata is detected and rebuilt; losing a single bookkeeping hash on its own is not.
 - **Postgres and Redis run without TLS or a Redis password** in Compose. Fine on one machine;
   anywhere else, use managed services or turn both on.
-- **The search checksum still scans the users table** in Postgres (one `GROUP BY` per run). That is
-  cheap in the database, and nothing crosses the network unless a range differs.
+- **The search checksum is probabilistic, and still scans the users table.** A missing or extra
+  document always changes a range's count, so it is always found. A document with the right id
+  but the wrong name changes the fingerprint sum unless its 31-bit fingerprint happens to equal
+  the right one, roughly 1 in 2 billion per wrong document; several errors could also cancel out
+  in the sum. Search still checks every hit against Postgres, so a missed document can make a
+  player hard to find but can never show the wrong player. The Postgres side is one `GROUP BY` per
+  run: cheap in the database, and nothing crosses the network unless a range differs.
 - **A rebuild of a huge tournament can outlive its 60-second lock**, and a second instance may then
   rebuild in parallel. That is safe, because every write is idempotent, but it is duplicate work.

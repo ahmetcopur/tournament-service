@@ -8,7 +8,8 @@ services:
       POSTGRES_USER: tournament
       POSTGRES_PASSWORD: tournament
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"   # 5433 so it doesn't clash with a local Postgres
+      # Published to this machine only (development credentials). In a real deployment, don't publish it.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"   # 5433 so it doesn't clash with a local Postgres
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -20,7 +21,8 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      # This machine only: Redis here has no password.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -92,7 +94,7 @@ services:
     volumes:
       - escerts:/certs:ro
     ports:
-      - "${APP_PORT:-8080}:8080"
+      - "${APP_PORT:-8080}:8080"   # the API, the one public port; every call but sign up needs a token
       # Actuator (health, metrics) is on 8081. Published to this machine only; never publicly.
       - "127.0.0.1:${MANAGEMENT_PORT:-8081}:8081"
     depends_on:
@@ -113,7 +115,7 @@ services:
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"   # this machine only
     depends_on:
       - app
 
@@ -131,7 +133,7 @@ services:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"   # this machine only: anonymous viewing is on
     depends_on:
       - prometheus
 
