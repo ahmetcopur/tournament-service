@@ -51,6 +51,35 @@ class LeaderboardIntegrationTest extends IntegrationTestBase {
         rank(t.getId(), fr).andExpect(jsonPath("$.rank").value(5));
     }
 
+    /**
+     * Review finding: same score in the same millisecond. Redis orders equal values by member
+     * string, Postgres by its own tie-break; the live board must match the final ranking.
+     */
+    @Test
+    void exactTiesRankTheSameLiveAsInTheFinalRanking() throws Exception {
+        Tournament t = openTournament();
+        FullGroup g = fullGroup();
+        long gb = g.player("GB"), de = g.player("DE");
+
+        // The clock doesn't move between these: both reach score 1 in the same millisecond.
+        levelUp(gb);
+        levelUp(de);
+
+        List<Long> live = userIds(body(groupBoard(g.groupId())));
+        List<Integer> liveRanks = new ArrayList<>();
+        for (long player : live) {
+            liveRanks.add(body(rank(t.getId(), player)).get("rank").asInt());
+        }
+
+        clock.set(CLOSING_TIME);
+        lifecycle.endOverdue(clock.instant());
+        List<Long> fin = jdbc.queryForList(
+                "SELECT user_id FROM group_members WHERE group_id = ? ORDER BY final_rank", Long.class, g.groupId());
+
+        assertThat(live).as("live board vs final ranking").isEqualTo(fin);
+        assertThat(liveRanks).containsExactly(1, 2, 3, 4, 5);
+    }
+
     @Test
     void countryBoardSumsScoresAcrossGroups() throws Exception {
         Tournament t = openTournament();

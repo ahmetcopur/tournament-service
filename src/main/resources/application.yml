@@ -56,6 +56,8 @@ game:
     close-cron: "0 0 20 * * *"              # keep in step with closes-at
   leaderboard:
     ttl-after-end: 2d
+    retry-every: PT5S     # re-apply groups whose Redis write failed
+    reapply-every: PT5M   # re-apply all open tournaments (covers writes lost silently)
   search:
     reconcile-every: PT10M   # re-index players missing from Elasticsearch
   jobs:

@@ -110,6 +110,41 @@ class PlayerSearchIntegrationTest extends IntegrationTestBase {
         find("q=" + name).andExpect(jsonPath("$[0].id").value(missing));
     }
 
+    /*
+     * Review finding: reconciling by document counts. Equal counts don't mean the same players,
+     * for example after Postgres was reset while Elasticsearch kept its data.
+     */
+
+    @Test
+    void reconcileFixesAMissingPlayerHiddenByAnOrphanedDocument() throws Exception {
+        signUp("anna");
+        long missing = newPlayer("TR"); // in Postgres, never indexed
+        String missingName = jdbc.queryForObject("SELECT username FROM users WHERE id = ?", String.class, missing);
+        elasticsearch.save(new PlayerDocument(9_999_999L, "ghost", "TR")); // no such user
+        refresh();
+        // Two users, two documents: a count comparison sees nothing to do.
+
+        search.reconcile();
+        refresh();
+
+        find("q=" + missingName).andExpect(jsonPath("$[0].id").value(missing));
+        assertThat(elasticsearch.get("9999999", PlayerDocument.class)).as("orphan removed").isNull();
+    }
+
+    @Test
+    void searchNeverReturnsAPlayerUnderAnotherName() throws Exception {
+        long id = signUp("realname").get("id").asLong();
+        // A leftover document for the same id with someone else's name.
+        elasticsearch.save(new PlayerDocument(id, "oldname", "TR"));
+        refresh();
+
+        assertThat(body(find("q=oldname"))).as("must not return 'realname' for 'oldname'").isEmpty();
+
+        search.reconcile();
+        refresh();
+        find("q=realname").andExpect(jsonPath("$[0].id").value(id));
+    }
+
     @Test
     void rejectsBadParameters() throws Exception {
         find("q=").andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_ERROR"));

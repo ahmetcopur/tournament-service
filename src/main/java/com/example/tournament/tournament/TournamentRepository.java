@@ -16,6 +16,13 @@ public interface TournamentRepository extends JpaRepository<Tournament, Long> {
 
     List<Tournament> findByStatusAndEndsAtLessThanEqual(Tournament.Status status, Instant now);
 
+    /** Finished tournaments whose final board rebuild hasn't succeeded yet, ended after {@code since}. */
+    List<Tournament> findByStatusAndBoardsFinalizedAtIsNullAndEndsAtAfter(Tournament.Status status, Instant since);
+
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query(value = "UPDATE tournaments SET boards_finalized_at = :at WHERE id = :id", nativeQuery = true)
+    int markBoardsFinalized(@Param("id") long id, @Param("at") Instant at);
+
     /** The UNIQUE rule on starts_at lets several app instances run this at once; one insert wins. */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """

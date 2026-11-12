@@ -18,8 +18,13 @@ public interface UserRepository extends JpaRepository<User, Long> {
     /** Keyset pagination for re-indexing players into Elasticsearch. */
     List<User> findTop500ByIdGreaterThanOrderByIdAsc(long id);
 
-    /** Serialises joins for one user, so the entry checks below see committed state. */
-    @Query(value = "SELECT * FROM users WHERE id = :id FOR UPDATE", nativeQuery = true)
+    /**
+     * Serialises joins for one user, so the entry checks see committed state. FOR NO KEY UPDATE
+     * is the lock an UPDATE of non-key columns takes: it still conflicts with other joins, level
+     * ups and claims of this player, but unlike FOR UPDATE it doesn't block foreign-key checks
+     * from rows that reference the player.
+     */
+    @Query(value = "SELECT * FROM users WHERE id = :id FOR NO KEY UPDATE", nativeQuery = true)
     Optional<User> findByIdForUpdate(@Param("id") long id);
 
     @Modifying(flushAutomatically = true, clearAutomatically = true)

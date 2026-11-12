@@ -8,6 +8,9 @@ import com.example.tournament.tournament.Tournament;
 import com.example.tournament.tournament.TournamentLifecycleService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.sql.Connection;
+import java.sql.Statement;
+import javax.sql.DataSource;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -102,6 +105,8 @@ public abstract class IntegrationTestBase {
     protected MutableClock clock;
     @Autowired
     protected TournamentLifecycleService lifecycle;
+    @Autowired
+    protected DataSource dataSource;
 
     @BeforeEach
     void resetState() {
@@ -189,5 +194,46 @@ public abstract class IntegrationTestBase {
 
     protected JsonNode body(ResultActions result) throws Exception {
         return json.readTree(result.andReturn().getResponse().getContentAsString());
+    }
+
+    /** Freezes Redis (docker pause): commands time out until {@link #unpauseRedis()}. */
+    protected static void pauseRedis() {
+        REDIS.getDockerClient().pauseContainerCmd(REDIS.getContainerId()).exec();
+    }
+
+    protected static void unpauseRedis() {
+        REDIS.getDockerClient().unpauseContainerCmd(REDIS.getContainerId()).exec();
+    }
+
+    /**
+     * Holds a row lock in a separate transaction until the returned handle is closed, so a
+     * request touching that row has to wait. Use the lock a real competitor would take: for a
+     * users row that's FOR NO KEY UPDATE (what an UPDATE of level/coins takes). FOR UPDATE would
+     * also block foreign-key checks, which no real request does.
+     */
+    protected AutoCloseable holdLock(String lockSql) throws Exception {
+        Connection connection = dataSource.getConnection();
+        connection.setAutoCommit(false);
+        try (Statement statement = connection.createStatement()) {
+            statement.execute(lockSql);
+        }
+        return () -> {
+            connection.rollback();
+            connection.close();
+        };
+    }
+
+    /** Waits until some statement starting with {@code sqlPrefix} is blocked on a lock. */
+    protected void awaitBlockedOn(String sqlPrefix) throws InterruptedException {
+        for (int i = 0; i < 200; i++) {
+            Integer waiting = jdbc.queryForObject(
+                    "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE ?",
+                    Integer.class, sqlPrefix + "%");
+            if (waiting != null && waiting > 0) {
+                return;
+            }
+            Thread.sleep(25);
+        }
+        throw new AssertionError("No statement starting with '" + sqlPrefix + "' ever waited on a lock");
     }
 }

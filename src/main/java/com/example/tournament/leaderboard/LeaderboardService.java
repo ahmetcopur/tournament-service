@@ -22,8 +22,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.connection.RedisConnection;
-import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations.TypedTuple;
 import org.springframework.data.redis.core.script.RedisScript;
@@ -62,10 +60,29 @@ public class LeaderboardService {
         this.props = props;
     }
 
-    public List<LeaderboardEntry> groupLeaderboard(long groupId) {
+    /**
+     * Redis orders equal values by member string (so "15" before "14" in ZREVRANGE). Postgres
+     * breaks exact ties by the lower user id. Group boards hold five entries, so the read path
+     * simply re-sorts them the Postgres way: the live board, the rank endpoint and the 20:00
+     * ranking always agree.
+     */
+    private static final Comparator<TypedTuple<String>> RANKING_ORDER =
+            Comparator.comparing((TypedTuple<String> t) -> t.getScore(), Comparator.reverseOrder())
+                    .thenComparingLong(t -> Long.parseLong(t.getValue()));
+
+    /** The group board from Redis in ranking order, or null if Redis can't answer for all members. */
+    private List<TypedTuple<String>> rankedFromRedis(long groupId) {
         Set<TypedTuple<String>> board =
                 fromRedis(() -> redis.opsForZSet().reverseRangeWithScores(LeaderboardKeys.group(groupId), 0, -1));
-        if (board != null && board.size() >= props.groupSize()) {
+        if (board == null || board.size() < props.groupSize()) {
+            return null;
+        }
+        return board.stream().sorted(RANKING_ORDER).toList();
+    }
+
+    public List<LeaderboardEntry> groupLeaderboard(long groupId) {
+        List<TypedTuple<String>> board = rankedFromRedis(groupId);
+        if (board != null) {
             List<Long> ids = board.stream().map(t -> Long.parseLong(t.getValue())).toList();
             Map<Long, User> byId = usersById(ids);
             return board.stream().map(t -> {
@@ -88,18 +105,15 @@ public class LeaderboardService {
     public RankResponse rank(long tournamentId, long userId) {
         GroupMember member = members.findByTournamentIdAndUserId(tournamentId, userId)
                 .orElseThrow(() -> new ApiException(ErrorCode.NOT_IN_TOURNAMENT));
-        String key = LeaderboardKeys.group(member.getGroupId());
-        byte[] rawKey = key.getBytes();
-        byte[] rawMember = Long.toString(userId).getBytes();
-        List<Object> replies = fromRedis(() -> redis.executePipelined((RedisCallback<Object>) (RedisConnection c) -> {
-            c.zSetCommands().zCard(rawKey);
-            c.zSetCommands().zRevRank(rawKey, rawMember);
-            return null;
-        }));
-        if (replies != null && replies.size() == 2
-                && replies.get(0) instanceof Long size && size >= props.groupSize()
-                && replies.get(1) instanceof Long zeroBased) {
-            return new RankResponse((int) (zeroBased + 1));
+        // Not ZREVRANK: its tie order differs from the ranking (see RANKING_ORDER).
+        List<TypedTuple<String>> board = rankedFromRedis(member.getGroupId());
+        if (board != null) {
+            String self = Long.toString(userId);
+            for (int i = 0; i < board.size(); i++) {
+                if (self.equals(board.get(i).getValue())) {
+                    return new RankResponse(i + 1);
+                }
+            }
         }
 
         List<GroupMember> ranked = members.findRanked(member.getGroupId());

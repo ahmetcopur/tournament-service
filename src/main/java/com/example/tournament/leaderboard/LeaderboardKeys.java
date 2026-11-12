@@ -28,4 +28,9 @@ public final class LeaderboardKeys {
     public static String countryRebuildLock(long tournamentId) {
         return country(tournamentId) + ":rebuild";
     }
+
+    /** Lock that lets one instance per interval re-apply a tournament's boards from Postgres. */
+    public static String reapplyLock(long tournamentId) {
+        return country(tournamentId) + ":reapply";
+    }
 }
