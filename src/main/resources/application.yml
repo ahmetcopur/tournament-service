@@ -30,6 +30,8 @@ server:
   shutdown: graceful
 
 management:
+  server:
+    port: ${MANAGEMENT_PORT:8081}   # actuator only here; keep this port internal
   endpoints:
     web:
       exposure:
@@ -40,6 +42,13 @@ management:
     distribution:
       percentiles-histogram:
         http.server.requests: true
+
+# Player tokens (HS256). Set AUTH_TOKEN_SECRET (32+ bytes) everywhere except a laptop; without it
+# the app signs with a random key that dies on restart.
+auth:
+  token-secret: ${AUTH_TOKEN_SECRET:}
+  token-ttl: 30d
+  issuer: tournament-service
 
 # Game rules. Every value can be changed here (or with env vars) without code changes.
 game:

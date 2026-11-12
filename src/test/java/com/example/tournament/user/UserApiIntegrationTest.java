@@ -47,14 +47,14 @@ class UserApiIntegrationTest extends IntegrationTestBase {
     @Test
     void getReturnsTheUser() throws Exception {
         long id = body(createUser("carol")).get("id").asLong();
-        mvc.perform(get("/users/{id}", id))
+        mvc.perform(get("/users/{id}", id).with(as(id)))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.username").value("carol"));
     }
 
     @Test
     void unknownUserIs404() throws Exception {
-        mvc.perform(get("/users/{id}", 999_999))
+        mvc.perform(get("/users/{id}", 999_999).with(as(999_999)))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("USER_NOT_FOUND"))
                 .andExpect(jsonPath("$.message").isString());
@@ -75,7 +75,7 @@ class UserApiIntegrationTest extends IntegrationTestBase {
 
     @Test
     void unknownRouteUsesTheErrorFormat() throws Exception {
-        mvc.perform(get("/nope"))
+        mvc.perform(get("/nope").with(anyPlayer()))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("NOT_FOUND"));
     }

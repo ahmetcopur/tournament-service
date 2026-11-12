@@ -1,7 +1,9 @@
 {
   "dynamic": "strict",
   "properties": {
-    "id": { "type": "long" },
+    "id": {
+      "type": "long"
+    },
     "username": {
       "type": "keyword",
       "normalizer": "lowercase",
@@ -13,6 +15,11 @@
         }
       }
     },
-    "country": { "type": "keyword" }
+    "country": {
+      "type": "keyword"
+    },
+    "fingerprint": {
+      "type": "long"
+    }
   }
 }

@@ -27,30 +27,74 @@ services:
       timeout: 3s
       retries: 30
 
+  # Creates the TLS certificates (before Elasticsearch starts) and the app's least-privilege
+  # user (once it is up), then exits. Re-running is harmless.
+  es-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.8
+    user: "0"
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-elastic-local-only}
+      ES_APP_PASSWORD: ${ES_APP_PASSWORD:-app-local-only}
+    volumes:
+      - escerts:/usr/share/elasticsearch/config/certs
+      - ./monitoring/elasticsearch/setup.sh:/setup.sh:ro
+    command: ["bash", "/setup.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/elasticsearch/elasticsearch.crt ]"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.18.8
+    depends_on:
+      es-setup:
+        condition: service_healthy
     environment:
       discovery.type: single-node
-      xpack.security.enabled: "false"   # local only; turn security on anywhere real
       ES_JAVA_OPTS: -Xms512m -Xmx512m
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-elastic-local-only}
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "true"
+      xpack.security.http.ssl.key: certs/elasticsearch/elasticsearch.key
+      xpack.security.http.ssl.certificate: certs/elasticsearch/elasticsearch.crt
+      xpack.security.http.ssl.certificate_authorities: certs/ca/ca.crt
+      xpack.security.transport.ssl.enabled: "true"
+      xpack.security.transport.ssl.key: certs/elasticsearch/elasticsearch.key
+      xpack.security.transport.ssl.certificate: certs/elasticsearch/elasticsearch.crt
+      xpack.security.transport.ssl.certificate_authorities: certs/ca/ca.crt
+      xpack.security.transport.ssl.verification_mode: certificate
+    volumes:
+      - escerts:/usr/share/elasticsearch/config/certs:ro
     ports:
-      - "${ELASTICSEARCH_PORT:-9200}:9200"
+      - "127.0.0.1:${ELASTICSEARCH_PORT:-9200}:9200"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs 'localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' || exit 1"]
+      test: ["CMD-SHELL", "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'"]
       interval: 5s
       timeout: 5s
-      retries: 30
+      retries: 60
 
   app:
     build: .
     environment:
       DB_URL: jdbc:postgresql://postgres:5432/tournament
       REDIS_HOST: redis
-      ELASTICSEARCH_URIS: http://elasticsearch:9200
+      # Signing key for player tokens (32+ bytes). Empty means a random key per start.
+      AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET:-}
+      # Elasticsearch over HTTPS, as the least-privilege user, trusting only our CA.
+      ELASTICSEARCH_URIS: https://elasticsearch:9200
+      SPRING_ELASTICSEARCH_USERNAME: tournament_app
+      SPRING_ELASTICSEARCH_PASSWORD: ${ES_APP_PASSWORD:-app-local-only}
+      SPRING_ELASTICSEARCH_RESTCLIENT_SSL_BUNDLE: elasticsearch
+      SPRING_SSL_BUNDLE_PEM_ELASTICSEARCH_TRUSTSTORE_CERTIFICATE: file:/certs/ca/ca.crt
       # Set TOURNAMENT_CLOSES_AT=24h to play or load test after 20:00 UTC.
       TOURNAMENT_CLOSES_AT: ${TOURNAMENT_CLOSES_AT:-20h}
+    volumes:
+      - escerts:/certs:ro
     ports:
       - "${APP_PORT:-8080}:8080"
+      # Actuator (health, metrics) is on 8081. Published to this machine only; never publicly.
+      - "127.0.0.1:${MANAGEMENT_PORT:-8081}:8081"
     depends_on:
       postgres:
         condition: service_healthy
@@ -58,6 +102,8 @@ services:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
+      es-setup:
+        condition: service_completed_successfully
 
   prometheus:
     image: prom/prometheus:v3.15.1
@@ -91,3 +137,4 @@ services:
 
 volumes:
   pgdata:
+  escerts:

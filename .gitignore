@@ -4,3 +4,5 @@ target/
 .vscode/
 .DS_Store
 load-test/results/
+.env
+certs/

@@ -4,6 +4,8 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 
 import com.example.tournament.TournamentApplication;
+import com.example.tournament.leaderboard.CountryBoardLayout;
+import com.example.tournament.security.TokenService;
 import com.example.tournament.tournament.Tournament;
 import com.example.tournament.tournament.TournamentLifecycleService;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -16,6 +18,9 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -24,11 +29,13 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations.TypedTuple;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.test.web.servlet.request.RequestPostProcessor;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.elasticsearch.ElasticsearchContainer;
@@ -39,7 +46,11 @@ import org.testcontainers.elasticsearch.ElasticsearchContainer;
  */
 @SpringBootTest(classes = {TournamentApplication.class, TestClockConfig.class})
 @AutoConfigureMockMvc
-@TestPropertySource(properties = "game.jobs.enabled=false")
+@TestPropertySource(properties = {
+        "game.jobs.enabled=false",
+        "auth.token-secret=integration-tests-only-secret-0123456789abcdef",
+        "management.server.port=-1",
+        "game.leaderboard.country-board-cache=0s"})
 public abstract class IntegrationTestBase {
 
     @ServiceConnection
@@ -107,6 +118,10 @@ public abstract class IntegrationTestBase {
     protected TournamentLifecycleService lifecycle;
     @Autowired
     protected DataSource dataSource;
+    @Autowired
+    protected TokenService tokens;
+    @Autowired
+    protected CountryBoardLayout layout;
 
     @BeforeEach
     void resetState() {
@@ -168,11 +183,12 @@ public abstract class IntegrationTestBase {
     protected ResultActions join(long userId) throws Exception {
         return mvc.perform(post("/tournaments/current/entries")
                 .contentType(MediaType.APPLICATION_JSON)
-                .content("{\"userId\":" + userId + "}"));
+                .content("{\"userId\":" + userId + "}")
+                .with(as(userId)));
     }
 
     protected ResultActions levelUp(long userId) throws Exception {
-        return mvc.perform(post("/users/{id}/levels", userId));
+        return mvc.perform(post("/users/{id}/levels", userId).with(as(userId)));
     }
 
     protected ResultActions levelUp(long userId, int times) throws Exception {
@@ -185,11 +201,46 @@ public abstract class IntegrationTestBase {
     }
 
     protected ResultActions claim(long userId) throws Exception {
-        return mvc.perform(post("/users/{id}/rewards/claim", userId));
+        return mvc.perform(post("/users/{id}/rewards/claim", userId).with(as(userId)));
     }
 
     protected ResultActions groupBoard(long groupId) throws Exception {
-        return mvc.perform(get("/groups/{id}/leaderboard", groupId));
+        return mvc.perform(get("/groups/{id}/leaderboard", groupId).with(anyPlayer()));
+    }
+
+    /** The country board as Redis holds it: every slice added up, complete or not. */
+    protected Map<String, Long> redisCountryTotals(long tournamentId) {
+        Map<String, Long> totals = new TreeMap<>();
+        for (int shard = 0; shard < layout.shards(); shard++) {
+            Set<TypedTuple<String>> slice = redis.opsForZSet().rangeWithScores(layout.totals(tournamentId, shard), 0, -1);
+            if (slice != null) {
+                slice.forEach(t -> totals.merge(t.getValue(), t.getScore().longValue(), Long::sum));
+            }
+        }
+        return totals;
+    }
+
+    protected boolean countryBoardComplete(long tournamentId) {
+        for (int shard = 0; shard < layout.shards(); shard++) {
+            if (!"1".equals(redis.opsForHash().get(layout.meta(tournamentId, shard), "ready"))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Sends the request with a valid token for {@code userId}, i.e. as that player. */
+    protected RequestPostProcessor as(long userId) {
+        String token = tokens.issue(userId).token();
+        return request -> {
+            request.addHeader("Authorization", "Bearer " + token);
+            return request;
+        };
+    }
+
+    /** Any signed-in player, for endpoints that don't act for a particular player (boards, search). */
+    protected RequestPostProcessor anyPlayer() {
+        return as(0);
     }
 
     protected JsonNode body(ResultActions result) throws Exception {

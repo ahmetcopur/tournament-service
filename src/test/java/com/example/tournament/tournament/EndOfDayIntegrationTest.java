@@ -4,7 +4,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-import com.example.tournament.leaderboard.LeaderboardKeys;
 import com.example.tournament.support.IntegrationTestBase;
 import java.time.Duration;
 import java.time.Instant;
@@ -155,7 +154,7 @@ class EndOfDayIntegrationTest extends IntegrationTestBase {
         assertThat(coins(waitingTr)).isEqualTo(5000);
 
         // The final Redis boards match Postgres.
-        assertThat(redis.opsForZSet().score(LeaderboardKeys.country(t.getId()), "US")).isEqualTo(3.0);
+        assertThat(redisCountryTotals(t.getId())).containsEntry("US", 3L);
         assertThat(body(groupBoard(g.groupId())).get(0).get("userId").asLong()).isEqualTo(us);
     }
 

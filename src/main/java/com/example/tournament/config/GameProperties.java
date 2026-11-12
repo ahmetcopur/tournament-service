@@ -9,6 +9,7 @@ import jakarta.validation.constraints.PositiveOrZero;
 import java.time.Duration;
 import java.util.List;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
 /** Game rules from application.yml. Changing a value here never requires a code change. */
@@ -42,6 +43,15 @@ public record GameProperties(
         }
     }
 
-    public record LeaderboardRules(@NotNull Duration ttlAfterEnd) {
+    /**
+     * @param countryShards slices of each tournament's country board; each slice is its own Redis
+     *                      Cluster slot, so country traffic spreads over that many nodes. Changing
+     *                      it starts fresh boards (the count is part of the key), rebuilt from Postgres.
+     * @param countryBoardCache how long an instance reuses a summed country board. Reading it costs
+     *                      one Redis call per slice; it is one total for the whole tournament, so a
+     *                      second of staleness buys a lot. Zero turns the cache off.
+     */
+    public record LeaderboardRules(@NotNull Duration ttlAfterEnd, @DefaultValue("8") @Positive int countryShards,
+                                   @DefaultValue("1s") Duration countryBoardCache) {
     }
 }

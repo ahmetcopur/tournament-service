@@ -16,11 +16,11 @@ import org.springframework.test.web.servlet.ResultActions;
 class LeaderboardIntegrationTest extends IntegrationTestBase {
 
     private ResultActions rank(long tournamentId, long userId) throws Exception {
-        return mvc.perform(get("/tournaments/{id}/users/{userId}/rank", tournamentId, userId));
+        return mvc.perform(get("/tournaments/{id}/users/{userId}/rank", tournamentId, userId).with(anyPlayer()));
     }
 
     private ResultActions countryBoard(long tournamentId) throws Exception {
-        return mvc.perform(get("/tournaments/{id}/countries/leaderboard", tournamentId));
+        return mvc.perform(get("/tournaments/{id}/countries/leaderboard", tournamentId).with(anyPlayer()));
     }
 
     private static List<Long> userIds(JsonNode board) {
@@ -121,8 +121,7 @@ class LeaderboardIntegrationTest extends IntegrationTestBase {
         countryBoard(t.getId())
                 .andExpect(jsonPath("$[0].country").value("DE"))
                 .andExpect(jsonPath("$[0].score").value(3));
-        assertThat(redis.opsForZSet().score(LeaderboardKeys.country(t.getId()), "GB")).isEqualTo(1.0);
-        assertThat(redis.opsForZSet().score(LeaderboardKeys.country(t.getId()), "TR")).isEqualTo(1.0);
+        assertThat(redisCountryTotals(t.getId())).containsEntry("GB", 1L).containsEntry("TR", 1L);
     }
 
     @Test
@@ -136,8 +135,12 @@ class LeaderboardIntegrationTest extends IntegrationTestBase {
         long now = System.currentTimeMillis() / 1000;
         // TTLs are relative to the real clock, so compare absolute expiry times with some slack.
         assertThat(now + groupTtl).isBetween(expected - 5, expected + 5);
-        assertThat(now + redis.getExpire(LeaderboardKeys.country(t.getId()))).isBetween(expected - 5, expected + 5);
-        assertThat(now + redis.getExpire(LeaderboardKeys.countryApplied(t.getId()))).isBetween(expected - 5, expected + 5);
+        long tr = g.player("TR");
+        int slice = layout.shard(tr);
+        for (String key : List.of(layout.totals(t.getId(), slice), layout.meta(t.getId(), slice),
+                layout.bucketKey(t.getId(), slice, layout.bucket(tr)))) {
+            assertThat(now + redis.getExpire(key)).as(key).isBetween(expected - 5, expected + 5);
+        }
     }
 
     @Test

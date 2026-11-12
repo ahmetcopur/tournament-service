@@ -1,6 +1,8 @@
 package com.example.tournament.search;
 
 import co.elastic.clients.elasticsearch._types.SortOrder;
+import co.elastic.clients.elasticsearch._types.aggregations.Aggregation;
+import co.elastic.clients.elasticsearch._types.aggregations.HistogramBucket;
 import com.example.tournament.common.ApiException;
 import com.example.tournament.common.ErrorCode;
 import com.example.tournament.user.User;
@@ -13,6 +15,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.TreeSet;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
@@ -20,6 +24,7 @@ import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.elasticsearch.client.elc.ElasticsearchAggregations;
 import org.springframework.data.elasticsearch.client.elc.NativeQuery;
 import org.springframework.data.elasticsearch.client.elc.NativeQueryBuilder;
 import org.springframework.data.elasticsearch.core.ElasticsearchOperations;
@@ -43,6 +48,8 @@ public class PlayerSearchService {
 
     private static final Logger log = LoggerFactory.getLogger(PlayerSearchService.class);
     private static final int REINDEX_BATCH = 500;
+    /** Ids per checksum range. */
+    private static final long RANGE = 10_000;
 
     private final ElasticsearchOperations elasticsearch;
     private final UserRepository users;
@@ -105,7 +112,7 @@ public class PlayerSearchService {
         List<User> results = new ArrayList<>(hits.size());
         for (PlayerDocument hit : hits) {
             User user = byId.get(hit.id());
-            if (user != null && hit.equals(document(user))) {
+            if (user != null && hit.isFor(user)) {
                 results.add(user);
             } else {
                 staleHits.increment();
@@ -118,7 +125,7 @@ public class PlayerSearchService {
     public void onUserCreated(UserCreated event) {
         try {
             ensureIndex();
-            elasticsearch.save(new PlayerDocument(event.id(), event.username(), event.country()));
+            elasticsearch.save(PlayerDocument.of(event.id(), event.username(), event.country()));
         } catch (RuntimeException ex) {
             indexFailures.increment();
             log.warn("Could not index player {}; the reconcile job will retry: {}", event.id(), ex.getMessage());
@@ -134,36 +141,104 @@ public class PlayerSearchService {
         if (!index.exists()) {
             index.createWithMapping();
             log.info("Created Elasticsearch index 'players'");
+        } else {
+            index.putMapping(); // adds fields introduced since the index was created (e.g. fingerprint)
         }
         indexReady.set(true);
     }
 
+    /** What a reconcile run did, for logs and tests. */
+    public record ReconcileReport(int rangesTotal, int rangesExamined, long written, long deleted) {
+        public long fixed() {
+            return written + deleted;
+        }
+    }
+
+    /** See {@link #reconcileReport()}; returns the number of documents written or deleted. */
+    public long reconcile() {
+        return reconcileReport().fixed();
+    }
+
     /**
-     * Makes the index hold exactly the players in Postgres, compared by identity, not by count.
-     * Equal counts can hide a missing player behind an orphaned document, for example after
-     * Postgres was reset while Elasticsearch kept its data.
+     * Makes the index hold exactly the players in Postgres, compared by identity, not by count,
+     * and without reading every player each time.
      *
      * <ol>
-     *   <li>Postgres to Elasticsearch, 500 players at a time: fetch the same ids from the index
-     *       and (re)index every player whose document is missing or differs.</li>
-     *   <li>Elasticsearch to Postgres: walk every document and delete those whose player no
-     *       longer exists.</li>
+     *   <li>Checksums: for every range of 10,000 ids, Elasticsearch (one aggregation query) and
+     *       Postgres (one GROUP BY) each give the number of players and the sum of their
+     *       fingerprints. A range where both agree holds the same players with the same names.</li>
+     *   <li>Only ranges that differ are compared player by player: Postgres to Elasticsearch
+     *       (fetch the same ids, re-index what's missing or wrong) and Elasticsearch to Postgres
+     *       (delete documents whose player doesn't exist).</li>
      * </ol>
      *
-     * Both passes are idempotent and safe to run alongside sign ups. Cost is linear in the number
-     * of players; fine every few minutes for this scale, a per-batch checksum would avoid reading
-     * unchanged batches. Returns the number of documents written or deleted.
+     * In sync, a run costs one aggregation and one GROUP BY, however many players there are. Both
+     * passes are idempotent and safe alongside sign ups.
      */
-    public long reconcile() {
+    public ReconcileReport reconcileReport() {
         indexReady.set(false); // the index may have been deleted since we last looked
         ensureIndex();
         IndexOperations index = elasticsearch.indexOps(PlayerDocument.class);
+        index.refresh();
+
+        Map<Long, List<Long>> inIndex = indexChecksums();
+        Map<Long, List<Long>> inPostgres = new HashMap<>();
+        for (Object[] row : users.searchChecksums(RANGE)) {
+            inPostgres.put(((Number) row[0]).longValue(),
+                    List.of(((Number) row[1]).longValue(), ((Number) row[2]).longValue()));
+        }
+        Set<Long> ranges = new TreeSet<>(inIndex.keySet());
+        ranges.addAll(inPostgres.keySet());
+        List<Long> differing = ranges.stream()
+                .filter(range -> !Objects.equals(inIndex.get(range), inPostgres.get(range)))
+                .toList();
 
         long written = 0;
-        long lastId = 0;
+        long deleted = 0;
+        for (long range : differing) {
+            written += indexMissingOrWrong(range * RANGE, (range + 1) * RANGE);
+            index.refresh();
+            deleted += deleteOrphans(range * RANGE, (range + 1) * RANGE);
+        }
+        if (written + deleted > 0) {
+            index.refresh();
+            reconcileFixes.increment(written + deleted);
+            log.info("Search reconcile: {} of {} id ranges differed; {} players (re)indexed, {} orphaned documents deleted",
+                    differing.size(), ranges.size(), written, deleted);
+        }
+        return new ReconcileReport(ranges.size(), differing.size(), written, deleted);
+    }
+
+    /** Per id range: [documents, sum of fingerprints], in one aggregation query. */
+    private Map<Long, List<Long>> indexChecksums() {
+        NativeQuery query = NativeQuery.builder()
+                .withQuery(q -> q.matchAll(m -> m))
+                .withAggregation("ranges", Aggregation.of(a -> a
+                        .histogram(h -> h.field("id").interval((double) RANGE).minDocCount(1))
+                        .aggregations("fingerprints", Aggregation.of(sum -> sum.sum(f -> f.field("fingerprint"))))))
+                .withMaxResults(0)
+                .build();
+        ElasticsearchAggregations aggregations =
+                (ElasticsearchAggregations) elasticsearch.search(query, PlayerDocument.class).getAggregations();
+        Map<Long, List<Long>> checksums = new HashMap<>();
+        if (aggregations == null) {
+            return checksums;
+        }
+        for (HistogramBucket bucket : aggregations.aggregationsAsMap().get("ranges").aggregation()
+                .getAggregate().histogram().buckets().array()) {
+            long sum = (long) bucket.aggregations().get("fingerprints").sum().value();
+            checksums.put((long) (bucket.key() / RANGE), List.of(bucket.docCount(), sum));
+        }
+        return checksums;
+    }
+
+    /** Postgres to Elasticsearch for ids in [from, to): (re)index players missing or wrong. */
+    private long indexMissingOrWrong(long from, long to) {
+        long written = 0;
+        long lastId = from - 1;
         List<User> batch;
         do {
-            batch = users.findTop500ByIdGreaterThanOrderByIdAsc(lastId);
+            batch = users.findTop500ByIdGreaterThanAndIdLessThanOrderByIdAsc(lastId, to);
             if (batch.isEmpty()) {
                 break;
             }
@@ -177,7 +252,7 @@ public class PlayerSearchService {
                 }
             }
             List<PlayerDocument> fixes = batch.stream()
-                    .map(PlayerSearchService::document)
+                    .map(PlayerDocument::of)
                     .filter(expected -> !expected.equals(indexed.get(expected.id())))
                     .toList();
             if (!fixes.isEmpty()) {
@@ -186,43 +261,32 @@ public class PlayerSearchService {
             }
             lastId = batch.get(batch.size() - 1).getId();
         } while (batch.size() == REINDEX_BATCH);
+        return written;
+    }
 
-        index.refresh();
+    /** Elasticsearch to Postgres for ids in [from, to): delete documents whose player doesn't exist. */
+    private long deleteOrphans(long from, long to) {
         long deleted = 0;
-        try (SearchHitsIterator<PlayerDocument> all = elasticsearch.searchForStream(
-                new NativeQueryBuilder().withQuery(q -> q.matchAll(m -> m)).withPageable(PageRequest.of(0, REINDEX_BATCH)).build(),
-                PlayerDocument.class)) {
+        NativeQuery inRange = new NativeQueryBuilder()
+                .withQuery(q -> q.range(r -> r.number(n -> n.field("id").gte((double) from).lt((double) to))))
+                .withPageable(PageRequest.of(0, REINDEX_BATCH))
+                .build();
+        try (SearchHitsIterator<PlayerDocument> documents = elasticsearch.searchForStream(inRange, PlayerDocument.class)) {
             List<Long> chunk = new ArrayList<>(REINDEX_BATCH);
-            while (all.hasNext()) {
-                chunk.add(all.next().getContent().id());
-                if (chunk.size() == REINDEX_BATCH || !all.hasNext()) {
-                    deleted += deleteOrphans(chunk);
+            while (documents.hasNext()) {
+                chunk.add(documents.next().getContent().id());
+                if (chunk.size() == REINDEX_BATCH || !documents.hasNext()) {
+                    Set<Long> existing = users.findAllById(chunk).stream().map(User::getId).collect(Collectors.toSet());
+                    for (Long id : chunk) {
+                        if (!existing.contains(id)) {
+                            elasticsearch.delete(id.toString(), PlayerDocument.class);
+                            deleted++;
+                        }
+                    }
                     chunk.clear();
                 }
             }
         }
-
-        if (written + deleted > 0) {
-            index.refresh();
-            reconcileFixes.increment(written + deleted);
-            log.info("Search reconcile: {} players (re)indexed, {} orphaned documents deleted", written, deleted);
-        }
-        return written + deleted;
-    }
-
-    private long deleteOrphans(List<Long> ids) {
-        Set<Long> existing = users.findAllById(ids).stream().map(User::getId).collect(Collectors.toSet());
-        long deleted = 0;
-        for (Long id : ids) {
-            if (!existing.contains(id)) {
-                elasticsearch.delete(id.toString(), PlayerDocument.class);
-                deleted++;
-            }
-        }
         return deleted;
-    }
-
-    private static PlayerDocument document(User user) {
-        return new PlayerDocument(user.getId(), user.getUsername(), user.getCountry());
     }
 }

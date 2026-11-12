@@ -14,6 +14,8 @@ public enum ErrorCode {
 
     // Added for cases the doc leaves open
     USERNAME_TAKEN(HttpStatus.CONFLICT, "Username is already taken"),
+    UNAUTHORIZED(HttpStatus.UNAUTHORIZED, "Missing, invalid or expired token"),
+    FORBIDDEN(HttpStatus.FORBIDDEN, "You can only act as your own player"),
     TOURNAMENT_NOT_FOUND(HttpStatus.NOT_FOUND, "Unknown tournament id"),
     GROUP_NOT_FOUND(HttpStatus.NOT_FOUND, "Unknown group id"),
     NOT_IN_TOURNAMENT(HttpStatus.NOT_FOUND, "User did not join this tournament"),

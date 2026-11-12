@@ -15,8 +15,22 @@ public interface UserRepository extends JpaRepository<User, Long> {
 
     boolean existsByUsername(String username);
 
-    /** Keyset pagination for re-indexing players into Elasticsearch. */
-    List<User> findTop500ByIdGreaterThanOrderByIdAsc(long id);
+    /** Keyset pagination over one id range, for comparing players with Elasticsearch. */
+    List<User> findTop500ByIdGreaterThanAndIdLessThanOrderByIdAsc(long afterId, long beforeId);
+
+    /**
+     * The Postgres side of the search checksum: per range of {@code size} ids, [range, players,
+     * sum of fingerprints]. The fingerprint is computed exactly as PlayerDocument.fingerprint does.
+     */
+    @Query(value = """
+            SELECT id / :size,
+                   count(*),
+                   sum((('x' || substr(md5(id || ':' || username || ':' || country), 1, 8))::bit(32)::int
+                        & 2147483647)::bigint)
+            FROM users
+            GROUP BY 1
+            """, nativeQuery = true)
+    List<Object[]> searchChecksums(@Param("size") long size);
 
     /**
      * Serialises joins for one user, so the entry checks see committed state. FOR NO KEY UPDATE

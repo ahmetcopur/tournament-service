@@ -46,7 +46,7 @@ class UserServiceTest {
         GameProperties props = new GameProperties(5000, List.of("TR", "US", "GB", "DE", "FR"), 25,
                 new GameProperties.TournamentRules(Duration.ZERO, Duration.ofHours(20), 20, 1000,
                         List.of(10_000L, 5_000L)),
-                new GameProperties.LeaderboardRules(Duration.ofDays(2)));
+                new GameProperties.LeaderboardRules(Duration.ofDays(2), 8, Duration.ZERO));
         service = new UserService(users, scoring, countryPicker, props,
                 new TimeSource(Clock.fixed(NOW, ZoneOffset.UTC)), events);
     }

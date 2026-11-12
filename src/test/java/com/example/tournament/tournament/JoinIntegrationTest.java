@@ -107,11 +107,11 @@ class JoinIntegrationTest extends IntegrationTestBase {
     @Test
     void currentTournamentExistsEvenBeforeStartupOrMidnightCreatedIt() throws Exception {
         // No tournament row at all, like a fresh instance before its startup tasks ran.
-        JsonNode first = body(mvc.perform(get("/tournaments/current")).andExpect(status().isOk()));
+        JsonNode first = body(mvc.perform(get("/tournaments/current").with(anyPlayer())).andExpect(status().isOk()));
         assertThat(first.get("open").asBoolean()).isTrue();
         assertThat(first.get("endsAt").asText()).isEqualTo(CLOSING_TIME.toString());
 
-        mvc.perform(get("/tournaments/current")).andExpect(jsonPath("$.id").value(first.get("id").asLong()));
+        mvc.perform(get("/tournaments/current").with(anyPlayer())).andExpect(jsonPath("$.id").value(first.get("id").asLong()));
         assertThat(jdbc.queryForObject("SELECT count(*) FROM tournaments", Integer.class)).isEqualTo(1);
     }
 

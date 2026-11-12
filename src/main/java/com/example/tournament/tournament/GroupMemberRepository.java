@@ -3,6 +3,7 @@ package com.example.tournament.tournament;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -35,12 +36,36 @@ public interface GroupMemberRepository extends JpaRepository<GroupMember, Long> 
             """)
     List<GroupMember> findRanked(@Param("groupId") long groupId);
 
+    /**
+     * One page of members of full groups, in member id order (keyset paging: pass the last id
+     * seen). Values, not entities, so a rebuild's memory stays at one page however big the
+     * tournament is.
+     */
     @Query("""
-            select m from GroupMember m where m.tournamentId = :tournamentId and m.groupId in (
-                select g.id from TournamentGroup g where g.tournamentId = :tournamentId and g.startedAt is not null)
-            order by m.groupId, m.id
+            select new com.example.tournament.tournament.MemberScore(
+                       m.id, m.groupId, m.userId, m.country, m.score, m.scoreUpdatedAt)
+            from GroupMember m, TournamentGroup g
+            where g.id = m.groupId and g.tournamentId = :tournamentId and g.startedAt is not null
+              and m.id > :afterId
+            order by m.id
             """)
-    List<GroupMember> findInStartedGroups(@Param("tournamentId") long tournamentId);
+    List<MemberScore> findStartedPage(@Param("tournamentId") long tournamentId, @Param("afterId") long afterId,
+                                      Pageable page);
+
+    /**
+     * Like {@link #findStartedPage} but only members whose score changed, or whose group filled,
+     * since {@code since}: what the periodic re-apply needs to send to Redis.
+     */
+    @Query("""
+            select new com.example.tournament.tournament.MemberScore(
+                       m.id, m.groupId, m.userId, m.country, m.score, m.scoreUpdatedAt)
+            from GroupMember m, TournamentGroup g
+            where g.id = m.groupId and g.tournamentId = :tournamentId and g.startedAt is not null
+              and m.id > :afterId and (m.scoreUpdatedAt >= :since or g.startedAt >= :since)
+            order by m.id
+            """)
+    List<MemberScore> findStartedChangedPage(@Param("tournamentId") long tournamentId, @Param("since") Instant since,
+                                             @Param("afterId") long afterId, Pageable page);
 
     @Query("""
             select m.country, sum(m.score) from GroupMember m

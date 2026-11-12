@@ -6,4 +6,4 @@ scrape_configs:
   - job_name: tournament-service
     metrics_path: /actuator/prometheus
     static_configs:
-      - targets: ["app:8080"]
+      - targets: ["app:8081"]   # the management port

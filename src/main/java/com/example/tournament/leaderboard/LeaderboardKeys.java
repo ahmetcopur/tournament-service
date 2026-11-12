@@ -1,9 +1,8 @@
 package com.example.tournament.leaderboard;
 
 /**
- * Redis key names. Group boards are independent keys, so they spread across a Redis Cluster.
- * A tournament's country board and its bookkeeping share the {tournamentId} hash tag, so one
- * script can update them together.
+ * Redis key names for group boards and per-tournament locks. Group boards are independent keys,
+ * so they spread across a Redis Cluster. Country board keys are in {@link CountryBoardLayout}.
  */
 public final class LeaderboardKeys {
 
@@ -14,23 +13,18 @@ public final class LeaderboardKeys {
         return "lb:group:" + groupId;
     }
 
-    /** Sorted set: country -> total score. */
-    public static String country(long tournamentId) {
-        return "lb:country:{" + tournamentId + "}";
-    }
-
-    /** Hash: user id -> highest score already counted on the country board, plus "_ready". */
-    public static String countryApplied(long tournamentId) {
-        return country(tournamentId) + ":applied";
-    }
-
-    /** Lock so only one instance rebuilds a country board at a time. */
+    /** Lock so only one instance rebuilds a tournament's country board at a time. */
     public static String countryRebuildLock(long tournamentId) {
-        return country(tournamentId) + ":rebuild";
+        return "lb:country:{t" + tournamentId + "}:rebuild";
     }
 
     /** Lock that lets one instance per interval re-apply a tournament's boards from Postgres. */
     public static String reapplyLock(long tournamentId) {
-        return country(tournamentId) + ":reapply";
+        return "lb:country:{t" + tournamentId + "}:reapply";
+    }
+
+    /** When the last re-apply started (epoch millis); the next one only sends changes since then. */
+    public static String reappliedAt(long tournamentId) {
+        return "lb:country:{t" + tournamentId + "}:reapplied-at";
     }
 }

@@ -40,22 +40,11 @@ class CountryBoardIntegrationTest extends IntegrationTestBase {
         return totals;
     }
 
-    private Map<String, Long> redisTotals(long tournamentId) {
-        Map<String, Long> totals = new TreeMap<>();
-        redis.opsForZSet().rangeWithScores(LeaderboardKeys.country(tournamentId), 0, -1)
-                .forEach(t -> totals.put(t.getValue(), t.getScore().longValue()));
-        return totals;
-    }
-
     private Map<String, Long> apiTotals(long tournamentId) throws Exception {
         Map<String, Long> totals = new TreeMap<>();
-        body(mvc.perform(get("/tournaments/{id}/countries/leaderboard", tournamentId)))
+        body(mvc.perform(get("/tournaments/{id}/countries/leaderboard", tournamentId).with(anyPlayer())))
                 .forEach(row -> totals.put(row.get("country").asText(), row.get("score").asLong()));
         return totals;
-    }
-
-    private boolean complete(long tournamentId) {
-        return redis.opsForHash().hasKey(LeaderboardKeys.countryApplied(tournamentId), "_ready");
     }
 
     /** A score update as the after-commit listener sees it, for replaying late or twice. */
@@ -75,7 +64,7 @@ class CountryBoardIntegrationTest extends IntegrationTestBase {
         writer.onScoreChanged(update(t, g, "TR", 1));
         writer.onScoreChanged(update(t, g, "TR", 2));
 
-        assertThat(redisTotals(t.getId())).containsEntry("TR", 3L).isEqualTo(postgresTotals(t.getId()));
+        assertThat(redisCountryTotals(t.getId())).containsEntry("TR", 3L).isEqualTo(postgresTotals(t.getId()));
     }
 
     @Test
@@ -92,13 +81,13 @@ class CountryBoardIntegrationTest extends IntegrationTestBase {
 
         // The next update finds the board gone, applies itself and rebuilds the rest from Postgres.
         levelUp(second.player("GB"), 1);
-        assertThat(complete(t.getId())).isTrue();
+        assertThat(countryBoardComplete(t.getId())).isTrue();
 
         // Updates that committed before the wipe but reach Redis only now are already counted.
         writer.onScoreChanged(update(t, first, "TR", 2));
         writer.onScoreChanged(update(t, first, "DE", 3));
 
-        assertThat(redisTotals(t.getId())).isEqualTo(postgresTotals(t.getId()))
+        assertThat(redisCountryTotals(t.getId())).isEqualTo(postgresTotals(t.getId()))
                 .containsEntry("TR", 3L).containsEntry("DE", 4L).containsEntry("GB", 1L);
         assertThat(apiTotals(t.getId())).isEqualTo(postgresTotals(t.getId()));
     }
@@ -116,15 +105,15 @@ class CountryBoardIntegrationTest extends IntegrationTestBase {
         levelUp(g.player("FR"), 1);
         // The update was applied, but the board is incomplete (US's points are missing),
         // so it isn't served; the API answers from Postgres instead.
-        assertThat(complete(t.getId())).isFalse();
-        assertThat(redisTotals(t.getId())).containsEntry("FR", 1L).doesNotContainKey("US");
+        assertThat(countryBoardComplete(t.getId())).isFalse();
+        assertThat(redisCountryTotals(t.getId())).containsEntry("FR", 1L).doesNotContainKey("US");
         assertThat(apiTotals(t.getId())).isEqualTo(postgresTotals(t.getId())).containsEntry("US", 2L);
 
         // The other instance gave up; the next update takes over the rebuild.
         redis.delete(lock);
         levelUp(g.player("FR"), 1);
-        assertThat(complete(t.getId())).isTrue();
-        assertThat(redisTotals(t.getId())).isEqualTo(postgresTotals(t.getId()));
+        assertThat(countryBoardComplete(t.getId())).isTrue();
+        assertThat(redisCountryTotals(t.getId())).isEqualTo(postgresTotals(t.getId()));
     }
 
     @Test
@@ -155,8 +144,8 @@ class CountryBoardIntegrationTest extends IntegrationTestBase {
         pool.shutdown();
 
         assertThat(postgresTotals(t.getId()).values().stream().mapToLong(Long::longValue).sum()).isEqualTo(total);
-        assertThat(complete(t.getId())).isTrue();
-        assertThat(redisTotals(t.getId())).isEqualTo(postgresTotals(t.getId()));
+        assertThat(countryBoardComplete(t.getId())).isTrue();
+        assertThat(redisCountryTotals(t.getId())).isEqualTo(postgresTotals(t.getId()));
     }
 
     @Test
@@ -165,24 +154,51 @@ class CountryBoardIntegrationTest extends IntegrationTestBase {
         double rebuildsBefore = meters.counter("leaderboard.country.rebuilds").count();
 
         writer.rebuildIfMissing(t.getId()); // what startup does
-        assertThat(redis.hasKey(LeaderboardKeys.countryApplied(t.getId()))).isFalse();
+        for (int shard = 0; shard < layout.shards(); shard++) {
+            assertThat(redis.hasKey(layout.meta(t.getId(), shard))).isFalse();
+        }
 
         fullGroup();
-        assertThat(complete(t.getId())).isTrue();
+        assertThat(countryBoardComplete(t.getId())).isTrue();
         assertThat(meters.counter("leaderboard.country.rebuilds").count() - rebuildsBefore).isEqualTo(1);
     }
 
     @Test
-    void halfALostBoardIsDiscardedAndRebuilt() throws Exception {
+    void aSliceThatLostHalfOfItsKeysIsRebuiltWithoutDoubleCounting() throws Exception {
         Tournament t = openTournament();
         FullGroup g = fullGroup();
-        levelUp(g.player("TR"), 2);
+        long tr = g.player("TR");
+        levelUp(tr, 2);
+        int slice = layout.shard(tr);
 
-        // Say eviction removed only the bookkeeping hash. Re-applying from -1 would double count,
-        // so the script drops the totals too and the board is rebuilt.
-        redis.delete(LeaderboardKeys.countryApplied(t.getId()));
-        levelUp(g.player("TR"), 1);
+        // Say eviction removed a slice's totals but left its bookkeeping. Trusting that
+        // bookkeeping would add TR's 2 points never again; the slice starts a new epoch instead,
+        // ignores the stale bookkeeping, and is rebuilt.
+        redis.delete(layout.totals(t.getId(), slice));
+        levelUp(tr, 1);
+        assertThat(redisCountryTotals(t.getId())).isEqualTo(postgresTotals(t.getId())).containsEntry("TR", 3L);
 
-        assertThat(redisTotals(t.getId())).isEqualTo(postgresTotals(t.getId())).containsEntry("TR", 3L);
+        // And the other way round: the bookkeeping's anchor (meta) gone, totals left behind.
+        redis.delete(layout.meta(t.getId(), slice));
+        levelUp(tr, 1);
+        assertThat(redisCountryTotals(t.getId())).isEqualTo(postgresTotals(t.getId())).containsEntry("TR", 4L);
+        assertThat(countryBoardComplete(t.getId())).isTrue();
+    }
+
+    @Test
+    void theBoardIsSplitIntoSlicesThatAddUp() throws Exception {
+        Tournament t = openTournament();
+        FullGroup g = fullGroup();
+        for (long player : g.playerIds()) {
+            levelUp(player, 1);
+        }
+        long slicesWithPoints = 0;
+        for (int shard = 0; shard < layout.shards(); shard++) {
+            Double sum = redis.opsForZSet().rangeWithScores(layout.totals(t.getId(), shard), 0, -1).stream()
+                    .mapToDouble(x -> x.getScore()).sum();
+            slicesWithPoints += sum > 0 ? 1 : 0;
+        }
+        assertThat(slicesWithPoints).as("five consecutive players land in five slices").isEqualTo(5);
+        assertThat(apiTotals(t.getId())).isEqualTo(postgresTotals(t.getId()));
     }
 }

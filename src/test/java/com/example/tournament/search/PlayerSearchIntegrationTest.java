@@ -7,6 +7,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.example.tournament.support.IntegrationTestBase;
+import com.example.tournament.user.UserRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,6 +24,8 @@ class PlayerSearchIntegrationTest extends IntegrationTestBase {
     private ElasticsearchOperations elasticsearch;
     @Autowired
     private PlayerSearchService search;
+    @Autowired
+    private UserRepository userRepository;
 
     @BeforeEach
     void freshIndex() {
@@ -40,7 +43,7 @@ class PlayerSearchIntegrationTest extends IntegrationTestBase {
     }
 
     private ResultActions find(String query) throws Exception {
-        return mvc.perform(get("/users/search?" + query));
+        return mvc.perform(get("/users/search?" + query).with(anyPlayer()));
     }
 
     private static List<String> usernames(JsonNode results) {
@@ -120,7 +123,7 @@ class PlayerSearchIntegrationTest extends IntegrationTestBase {
         signUp("anna");
         long missing = newPlayer("TR"); // in Postgres, never indexed
         String missingName = jdbc.queryForObject("SELECT username FROM users WHERE id = ?", String.class, missing);
-        elasticsearch.save(new PlayerDocument(9_999_999L, "ghost", "TR")); // no such user
+        elasticsearch.save(PlayerDocument.of(9_999_999L, "ghost", "TR")); // no such user
         refresh();
         // Two users, two documents: a count comparison sees nothing to do.
 
@@ -135,7 +138,7 @@ class PlayerSearchIntegrationTest extends IntegrationTestBase {
     void searchNeverReturnsAPlayerUnderAnotherName() throws Exception {
         long id = signUp("realname").get("id").asLong();
         // A leftover document for the same id with someone else's name.
-        elasticsearch.save(new PlayerDocument(id, "oldname", "TR"));
+        elasticsearch.save(PlayerDocument.of(id, "oldname", "TR"));
         refresh();
 
         assertThat(body(find("q=oldname"))).as("must not return 'realname' for 'oldname'").isEmpty();
@@ -146,10 +149,39 @@ class PlayerSearchIntegrationTest extends IntegrationTestBase {
     }
 
     @Test
+    void postgresAndJavaComputeTheSameFingerprint() {
+        long id = newPlayer("TR");
+        String name = jdbc.queryForObject("SELECT username FROM users WHERE id = ?", String.class, id);
+
+        List<Object[]> checksums = userRepository.searchChecksums(10_000);
+
+        assertThat(checksums).hasSize(1);
+        assertThat(((Number) checksums.get(0)[1]).longValue()).isEqualTo(1);
+        assertThat(((Number) checksums.get(0)[2]).longValue()).isEqualTo(PlayerDocument.fingerprint(id, name, "TR"));
+    }
+
+    @Test
+    void reconcileOnlyExaminesIdRangesThatDiffer() {
+        // Three players in three different ranges of 10,000 ids.
+        for (long id : List.of(5L, 15_005L, 30_005L)) {
+            jdbc.update("INSERT INTO users (id, username, country) VALUES (?, ?, 'TR')", id, "ranged" + id);
+        }
+
+        assertThat(search.reconcileReport()).extracting("rangesTotal", "rangesExamined", "written")
+                .containsExactly(3, 3, 3L);
+        assertThat(search.reconcileReport()).as("in sync: one aggregation, one GROUP BY, nothing examined")
+                .extracting("rangesExamined", "written", "deleted").containsExactly(0, 0L, 0L);
+
+        elasticsearch.save(PlayerDocument.of(15_005L, "someone-else", "TR"));
+        refresh();
+        assertThat(search.reconcileReport()).extracting("rangesExamined", "written").containsExactly(1, 1L);
+    }
+
+    @Test
     void rejectsBadParameters() throws Exception {
         find("q=").andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("VALIDATION_ERROR"));
         find("q=a&limit=0").andExpect(status().isBadRequest());
         find("q=a&country=tr").andExpect(status().isBadRequest());
-        mvc.perform(get("/users/search")).andExpect(status().isBadRequest());
+        mvc.perform(get("/users/search").with(anyPlayer())).andExpect(status().isBadRequest());
     }
 }

@@ -34,48 +34,55 @@ export const options = {
   summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
 
-const JSON_HEADERS = { headers: { 'Content-Type': 'application/json' } };
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
 const pick = (list) => list[Math.floor(Math.random() * list.length)];
+// Every request but sign up carries the player's token from sign up.
+const as = (player, extra = {}) => ({
+  headers: Object.assign({ Authorization: `Bearer ${player.token}` }, JSON_HEADERS),
+  ...extra,
+});
 
 // Creates players, levels each one to 20, and joins them all, so level ups below score points.
 export function setup() {
-  const t = http.get(`${BASE}/tournaments/current`).json();
+  const run = Date.now().toString(36);
+  const created = http.batch(Array.from({ length: PLAYERS }, (_, i) =>
+    ['POST', `${BASE}/users`, JSON.stringify({ username: `k6_${run}_${i}` }), { headers: JSON_HEADERS }]));
+  const players = created.map((r) => ({ id: r.json('id'), token: r.json('token') }));
+
+  const t = http.get(`${BASE}/tournaments/current`, as(players[0])).json();
   if (!t.open) {
     fail(`tournament ${t.id} is not open (${t.startsAt} to ${t.endsAt}); start the app with TOURNAMENT_CLOSES_AT=24h`);
   }
-  const run = Date.now().toString(36);
-  const created = http.batch(Array.from({ length: PLAYERS }, (_, i) =>
-    ['POST', `${BASE}/users`, JSON.stringify({ username: `k6_${run}_${i}` }), JSON_HEADERS]));
-  const ids = created.map((r) => r.json('id'));
   for (let level = 1; level < 20; level++) {
-    http.batch(ids.map((id) => ['POST', `${BASE}/users/${id}/levels`, null]));
+    http.batch(players.map((p) => ['POST', `${BASE}/users/${p.id}/levels`, null, as(p)]));
   }
-  const joins = http.batch(ids.map((id) =>
-    ['POST', `${BASE}/tournaments/current/entries`, JSON.stringify({ userId: id }), JSON_HEADERS]));
+  const joins = http.batch(players.map((p) =>
+    ['POST', `${BASE}/tournaments/current/entries`, JSON.stringify({ userId: p.id }), as(p)]));
   const joined = joins.filter((r) => r.status === 201);
-  if (joined.length !== ids.length) {
-    fail(`only ${joined.length} of ${ids.length} joins succeeded: ${joins.find((r) => r.status !== 201).body}`);
+  if (joined.length !== players.length) {
+    fail(`only ${joined.length} of ${players.length} joins succeeded: ${joins.find((r) => r.status !== 201).body}`);
   }
   const groups = [...new Set(joined.map((r) => r.json('groupId')))];
   const active = joined.filter((r) => r.json('status') === 'ACTIVE').length;
-  console.log(`setup: ${ids.length} players in ${groups.length} groups (${active} groups full)`);
-  return { tournamentId: t.id, ids, groups };
+  console.log(`setup: ${players.length} players in ${groups.length} groups (${active} groups full)`);
+  return { tournamentId: t.id, players, groups };
 }
 
-// 60% level ups, 30% group boards, 5% rank lookups, 5% country board.
+// 60% level ups (as that player), 30% group boards, 5% rank lookups, 5% country board.
 export default function (data) {
   const roll = Math.random();
+  const me = pick(data.players);
   let res;
   if (roll < 0.6) {
-    res = http.post(`${BASE}/users/${pick(data.ids)}/levels`, null, { tags: { endpoint: 'level_up' } });
+    res = http.post(`${BASE}/users/${me.id}/levels`, null, as(me, { tags: { endpoint: 'level_up' } }));
   } else if (roll < 0.9) {
-    res = http.get(`${BASE}/groups/${pick(data.groups)}/leaderboard`, { tags: { endpoint: 'group_leaderboard' } });
+    res = http.get(`${BASE}/groups/${pick(data.groups)}/leaderboard`, as(me, { tags: { endpoint: 'group_leaderboard' } }));
   } else if (roll < 0.95) {
-    res = http.get(`${BASE}/tournaments/${data.tournamentId}/users/${pick(data.ids)}/rank`,
-      { tags: { endpoint: 'rank' } });
+    res = http.get(`${BASE}/tournaments/${data.tournamentId}/users/${pick(data.players).id}/rank`,
+      as(me, { tags: { endpoint: 'rank' } }));
   } else {
     res = http.get(`${BASE}/tournaments/${data.tournamentId}/countries/leaderboard`,
-      { tags: { endpoint: 'country_leaderboard' } });
+      as(me, { tags: { endpoint: 'country_leaderboard' } }));
   }
   check(res, { 'status 200': (r) => r.status === 200 });
 }

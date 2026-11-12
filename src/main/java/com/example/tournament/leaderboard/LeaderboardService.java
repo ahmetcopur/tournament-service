@@ -5,6 +5,7 @@ import com.example.tournament.common.ErrorCode;
 import com.example.tournament.config.GameProperties;
 import com.example.tournament.tournament.GroupMember;
 import com.example.tournament.tournament.GroupMemberRepository;
+import com.example.tournament.tournament.MemberScore;
 import com.example.tournament.tournament.TournamentGroup;
 import com.example.tournament.tournament.TournamentGroupRepository;
 import com.example.tournament.tournament.TournamentRepository;
@@ -12,9 +13,12 @@ import com.example.tournament.user.User;
 import com.example.tournament.user.UserRepository;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -44,13 +48,19 @@ public class LeaderboardService {
     private final TournamentRepository tournaments;
     private final LeaderboardWriter writer;
     private final GameProperties props;
+    private final CountryBoardLayout layout;
+    private final long countryCacheNanos;
+    private final ConcurrentMap<Long, CachedBoard> countryCache = new ConcurrentHashMap<>();
+
+    private record CachedBoard(List<CountryScore> board, long readAtNanos) {
+    }
     @SuppressWarnings("rawtypes")
     private final RedisScript<List> countryReadScript =
             RedisScript.of(new ClassPathResource("redis/country_read.lua"), List.class);
 
     public LeaderboardService(StringRedisTemplate redis, UserRepository users, GroupMemberRepository members,
                               TournamentGroupRepository groups, TournamentRepository tournaments,
-                              LeaderboardWriter writer, GameProperties props) {
+                              LeaderboardWriter writer, GameProperties props, CountryBoardLayout layout) {
         this.redis = redis;
         this.users = users;
         this.members = members;
@@ -58,6 +68,8 @@ public class LeaderboardService {
         this.tournaments = tournaments;
         this.writer = writer;
         this.props = props;
+        this.layout = layout;
+        this.countryCacheNanos = props.leaderboard().countryBoardCache().toNanos();
     }
 
     /**
@@ -96,7 +108,7 @@ public class LeaderboardService {
                 .orElseThrow(() -> new ApiException(ErrorCode.GROUP_NOT_FOUND));
         List<GroupMember> ranked = members.findRanked(groupId);
         if (group.getStatus() == TournamentGroup.Status.ACTIVE) {
-            writer.healGroup(groupId, group.getTournamentId(), ranked);
+            writer.healGroup(groupId, group.getTournamentId(), ranked.stream().map(MemberScore::of).toList());
         }
         return entries(ranked);
     }
@@ -125,25 +137,56 @@ public class LeaderboardService {
         throw new ApiException(ErrorCode.NOT_IN_TOURNAMENT);
     }
 
-    /** From Redis only when the board is complete; while it is missing or being rebuilt, from Postgres. */
-    @SuppressWarnings("unchecked")
+    private static final Comparator<CountryScore> COUNTRY_ORDER = Comparator.comparingLong(CountryScore::score)
+            .reversed().thenComparing(CountryScore::country, Comparator.reverseOrder());
+
+    /**
+     * The sum of the board's slices, from Redis only when every slice is complete; while any is
+     * missing or being rebuilt, from Postgres. Reused for up to game.leaderboard.country-board-cache
+     * (1 s): one total for the whole tournament, read by everyone, costing one call per slice.
+     */
     public List<CountryScore> countryLeaderboard(long tournamentId) {
-        List<String> flat = fromRedis(() -> (List<String>) redis.execute(countryReadScript,
-                List.of(LeaderboardKeys.country(tournamentId), LeaderboardKeys.countryApplied(tournamentId))));
-        if (flat != null && !flat.isEmpty()) {
-            List<CountryScore> board = new ArrayList<>(flat.size() / 2);
-            for (int i = 0; i + 1 < flat.size(); i += 2) {
-                board.add(new CountryScore(flat.get(i), (long) Double.parseDouble(flat.get(i + 1))));
+        if (countryCacheNanos > 0) {
+            CachedBoard cached = countryCache.get(tournamentId);
+            if (cached != null && System.nanoTime() - cached.readAtNanos() < countryCacheNanos) {
+                return cached.board();
             }
-            return board;
+        }
+        List<CountryScore> board = readCountryBoard(tournamentId);
+        if (countryCacheNanos > 0) {
+            countryCache.put(tournamentId, new CachedBoard(board, System.nanoTime()));
+        }
+        return board;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<CountryScore> readCountryBoard(long tournamentId) {
+        Map<String, Long> totals = new HashMap<>();
+        boolean fromRedis = true;
+        for (int shard = 0; shard < layout.shards() && fromRedis; shard++) {
+            int s = shard;
+            List<String> flat = fromRedis(() -> (List<String>) redis.execute(countryReadScript,
+                    List.of(layout.totals(tournamentId, s), layout.meta(tournamentId, s))));
+            if (flat == null || flat.isEmpty()) {
+                fromRedis = false;
+                break;
+            }
+            for (int i = 0; i + 1 < flat.size(); i += 2) {
+                totals.merge(flat.get(i), (long) Double.parseDouble(flat.get(i + 1)), Long::sum);
+            }
+        }
+        if (fromRedis) {
+            return totals.entrySet().stream()
+                    .map(e -> new CountryScore(e.getKey(), e.getValue()))
+                    .sorted(COUNTRY_ORDER)
+                    .toList();
         }
         if (!tournaments.existsById(tournamentId)) {
             throw new ApiException(ErrorCode.TOURNAMENT_NOT_FOUND);
         }
         return members.countryTotals(tournamentId).stream()
                 .map(row -> new CountryScore((String) row[0], ((Number) row[1]).longValue()))
-                .sorted(Comparator.comparingLong(CountryScore::score).reversed()
-                        .thenComparing(CountryScore::country, Comparator.reverseOrder()))
+                .sorted(COUNTRY_ORDER)
                 .toList();
     }
 

@@ -1,6 +1,7 @@
 package com.example.tournament.tournament;
 
 import com.example.tournament.config.TimeSource;
+import com.example.tournament.security.CurrentPlayer;
 import jakarta.validation.Valid;
 import java.time.Instant;
 import org.springframework.http.HttpStatus;
@@ -40,6 +41,7 @@ public class TournamentController {
     @PostMapping("/current/entries")
     @ResponseStatus(HttpStatus.CREATED)
     public JoinResponse join(@Valid @RequestBody JoinRequest request) {
+        CurrentPlayer.requireSelf(request.userId());
         return joins.join(request.userId());
     }
 }

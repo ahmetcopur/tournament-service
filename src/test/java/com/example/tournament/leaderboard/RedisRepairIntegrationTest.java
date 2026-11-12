@@ -33,13 +33,6 @@ class RedisRepairIntegrationTest extends IntegrationTestBase {
         return totals;
     }
 
-    private Map<String, Long> redisCountryTotals(long tournamentId) {
-        Map<String, Long> totals = new TreeMap<>();
-        redis.opsForZSet().rangeWithScores(LeaderboardKeys.country(tournamentId), 0, -1)
-                .forEach(t -> totals.put(t.getValue(), t.getScore().longValue()));
-        return totals;
-    }
-
     private Object boardsFinalizedAt(long tournamentId) {
         return jdbc.queryForObject("SELECT boards_finalized_at FROM tournaments WHERE id = ?", Object.class, tournamentId);
     }
