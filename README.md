@@ -122,6 +122,7 @@ All in [application.yml](src/main/resources/application.yml) under `game.*`; no 
 | Country board slices | `leaderboard.country-shards` | 8 |
 | Country board reuse | `leaderboard.country-board-cache` | 1 second |
 | Redis repair | `leaderboard.retry-every` / `reapply-every` | 5 seconds / 5 minutes |
+| Settlement catch-up | `tournament.reconcile-every` | every minute |
 | Player tokens | `auth.token-ttl` (key: `AUTH_TOKEN_SECRET`) | 30 days |
 | Search index check | `search.reconcile-every` | every 10 minutes |
 
@@ -164,8 +165,11 @@ for in-flight level ups), rank full groups by score then by who reached it first
 and refund players whose group never filled exactly the fee each one paid (stored on the entry,
 so a fee change mid-day doesn't matter). Ranks come from Postgres, so a Redis
 problem can't hand out wrong rewards. Running it twice, or on two instances, does nothing the
-second time. On startup the app creates today's row if it's missing and ends any tournament
-whose window has already passed.
+second time, and that is used: besides the 00:00 and 20:00 jobs, a reconcile every minute (and at
+startup) creates today's row if missing and settles any tournament past its end. If Postgres is
+down at 20:00, settlement happens a minute after it comes back, not the next day. One failing
+tournament doesn't stop the others. Settlement runs on its own scheduler thread; maintenance jobs
+(Redis repair, search reconcile, metrics) share a separate pool, so they can never delay it.
 
 **Redis and Postgres drifting apart.** Postgres is the source of truth, and every Redis write is
 idempotent, so a write can be retried, arrive late, or race a rebuild without counting a point twice
@@ -214,7 +218,8 @@ Elasticsearch holds only what people search by (id, username, country), written 
 after the commit. Results rank the exact name first, then names starting with the query
 (edge n-grams), then names within a typo or two (fuzzy). Level and coins come fresh from Postgres
 for the ids found, so level ups never touch Elasticsearch, and a hit is returned only if Postgres
-agrees on who the player is. A failed index write never fails a sign up. At startup and every
+agrees on who the player is. A new player is indexed by a background worker after the commit, so
+sign up never waits for Elasticsearch; a failed index write is retried by the reconcile. At startup and every
 10 minutes, a reconcile job makes the index match Postgres by identity, not by count, without
 reading every player. Each document carries a fingerprint (a hash of id, username and country,
 computed identically in Postgres). For each range of 10,000 ids, one Elasticsearch aggregation and
@@ -351,6 +356,10 @@ The known limits from the previous version, and what closed each one:
 | API over plain HTTP | Caddy in front: HTTPS only (TLS 1.3), the only public port | Over the network by hostname: verified certificate, 401 without a token; plain HTTP to the port is refused |
 | Elasticsearch's private key readable by the app | Keys `600` (the CA key root-only), archives deleted, the app mounts a volume with only the CA certificate | Before: user 1001 could read `elasticsearch.key`. After: neither key readable; the app sees only `ca.crt` |
 | Finalization cleanup not retried | Clean up first, record the Postgres marker last | Redis fails during cleanup: the tournament stays unfinalized, and the retry finishes the cleanup |
+| Settlement only at 20:00 and startup | A reconcile every minute settles anything overdue; one failing tournament doesn't block others | A Postgres error injected at 20:00: still ACTIVE; a minute later it is settled, with rewards and refunds exactly once |
+| One scheduler thread for every job | Settlement gets its own thread; maintenance shares a pool of two | Settlement keeps running every 50 ms while a maintenance job holds its thread for 3 s |
+| Sign up waited for Elasticsearch | Indexing moved to a background worker; the reconcile retries failures | With Elasticsearch frozen, sign up went from 3,272 ms to under 500 ms; the player is searchable once it's back |
+| Deployment untested in CI | `scripts/smoke-test.sh` runs against the real Compose stack in CI | 18 checks: HTTPS, 401/403 rules, actuator, Elasticsearch TLS and user, background indexing, localhost-only ports |
 
 ## Tests
 
@@ -358,9 +367,12 @@ The known limits from the previous version, and what closed each one:
 ./mvnw test        # needs Docker for Testcontainers
 ```
 
-76 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
+80 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
 Postgres, Redis (in cluster mode) and Elasticsearch containers. CI (GitHub Actions) runs them on
-every pull request and checks that the Docker image builds.
+every pull request, then starts the Compose stack and runs
+[scripts/smoke-test.sh](scripts/smoke-test.sh) against it: HTTPS, authentication, Elasticsearch
+security and port bindings, the things unit tests can't see. It runs locally too:
+`docker compose up -d --build && scripts/smoke-test.sh`.
 
 - **Users:** create, duplicate name, validation, level up.
 - **Authentication:** sign-up token works for its player; missing, malformed, tampered, expired and
@@ -385,9 +397,12 @@ every pull request and checks that the Docker image builds.
 - **Cutoff:** a level up or join that waits on the player's row across 20:00 scores nothing and
   is refused; so does a level up waiting on its group's row; a level up still waiting while the
   20:00 job ranks leaves the ranking alone.
+- **Settlement and scheduling:** a database error at 20:00 is settled by the next reconcile,
+  exactly once; settlement keeps running while a maintenance job is stuck.
 - **Search:** prefix, exact match first, typos, country filter, limit, fresh level from Postgres,
   reconcile of players missing from the index, orphaned and wrong documents, identical fingerprints
-  in Java and Postgres, only differing ranges examined, bad parameters.
+  in Java and Postgres, only differing ranges examined, sign up with Elasticsearch frozen, bad
+  parameters.
 - **Scale:** a 2,000-player tournament rebuilt page by page; bookkeeping memory against one plain
   hash and gone after finalization; the periodic re-apply sending only recent changes; the board
   split across slices.

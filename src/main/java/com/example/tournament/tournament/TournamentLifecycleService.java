@@ -64,8 +64,15 @@ public class TournamentLifecycleService {
         List<Tournament> overdue = tournaments.findByStatusAndEndsAtLessThanEqual(Tournament.Status.ACTIVE, now);
         int ended = 0;
         for (Tournament t : overdue) {
-            if (Boolean.TRUE.equals(tx.execute(status -> end(t.getId())))) {
-                ended++;
+            try {
+                if (Boolean.TRUE.equals(tx.execute(status -> end(t.getId())))) {
+                    ended++;
+                }
+            } catch (RuntimeException ex) {
+                // The transaction rolled back, so nothing was half done; the tournament is still
+                // ACTIVE and the next reconcile (every minute) tries again. One failing tournament
+                // doesn't stop the others.
+                log.error("Could not end tournament {}, will retry: {}", t.getId(), ex.getMessage());
             }
         }
         return ended;

@@ -18,6 +18,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeSet;
 import java.util.Set;
+import jakarta.annotation.PreDestroy;
+import java.time.Duration;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -57,6 +63,8 @@ public class PlayerSearchService {
     private final Counter staleHits;
     private final Counter reconcileFixes;
     private final AtomicBoolean indexReady = new AtomicBoolean(false);
+    /** One thread, bounded queue: sign-ups are never held up by indexing, and memory stays bounded. */
+    private final ExecutorService indexer;
 
     public PlayerSearchService(ElasticsearchOperations elasticsearch, UserRepository users, MeterRegistry meters) {
         this.elasticsearch = elasticsearch;
@@ -70,6 +78,16 @@ public class PlayerSearchService {
         this.reconcileFixes = Counter.builder("search.reconcile.fixes")
                 .description("Documents the reconcile job (re)indexed or deleted")
                 .register(meters);
+        this.indexer = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(10_000),
+                task -> {
+                    Thread thread = new Thread(task, "search-indexer");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                (task, executor) -> {
+                    indexFailures.increment();
+                    log.warn("Search indexing queue is full; the reconcile job will index the player");
+                });
     }
 
     /**
@@ -121,15 +139,35 @@ public class PlayerSearchService {
         return results;
     }
 
+    /**
+     * Indexes a new player off the request thread. An after-commit listener runs on the request
+     * thread, so indexing there made sign up wait for Elasticsearch: with it stalled, the player
+     * was committed but the response hung until the search timeout, and a client that gave up
+     * never received its token. Now the response returns right after the commit; if indexing
+     * fails, or the queue is full, the reconcile job indexes the player later.
+     */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onUserCreated(UserCreated event) {
-        try {
-            ensureIndex();
-            elasticsearch.save(PlayerDocument.of(event.id(), event.username(), event.country()));
-        } catch (RuntimeException ex) {
-            indexFailures.increment();
-            log.warn("Could not index player {}; the reconcile job will retry: {}", event.id(), ex.getMessage());
-        }
+        indexer.execute(() -> {
+            try {
+                ensureIndex();
+                elasticsearch.save(PlayerDocument.of(event.id(), event.username(), event.country()));
+            } catch (RuntimeException ex) {
+                indexFailures.increment();
+                log.warn("Could not index player {}; the reconcile job will retry: {}", event.id(), ex.getMessage());
+            }
+        });
+    }
+
+    /** Waits until every sign-up queued so far has been indexed (or has failed). For tests. */
+    public void awaitIndexed(Duration timeout) throws Exception {
+        indexer.submit(() -> { }).get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    @PreDestroy
+    void stopIndexer() throws InterruptedException {
+        indexer.shutdown();
+        indexer.awaitTermination(5, TimeUnit.SECONDS);
     }
 
     /** Creates the index with its analyzers if it doesn't exist (never with dynamic mapping). */

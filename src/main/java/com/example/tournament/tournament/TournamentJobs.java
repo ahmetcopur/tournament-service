@@ -3,6 +3,8 @@ package com.example.tournament.tournament;
 import com.example.tournament.config.TimeSource;
 import com.example.tournament.leaderboard.LeaderboardWriter;
 import java.time.Instant;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -11,10 +13,18 @@ import org.springframework.core.annotation.Order;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-/** The two daily jobs from the doc, plus the same work once at startup. */
+/**
+ * Tournament settlement: the two daily jobs from the doc, a reconcile every minute that catches
+ * up on anything they missed, and the same work once at startup.
+ *
+ * <p>They run on their own scheduler thread ({@code settlementScheduler}), so a long leaderboard
+ * rebuild or search reconcile on the shared maintenance threads can never delay 20:00.
+ */
 @Component
 @ConditionalOnProperty(name = "game.jobs.enabled", havingValue = "true", matchIfMissing = true)
 public class TournamentJobs {
+
+    private static final Logger log = LoggerFactory.getLogger(TournamentJobs.class);
 
     private final TournamentLifecycleService lifecycle;
     private final TournamentRepository tournaments;
@@ -29,15 +39,37 @@ public class TournamentJobs {
         this.time = time;
     }
 
-    @Scheduled(cron = "${game.tournament.open-cron}", zone = "UTC")
+    @Scheduled(cron = "${game.tournament.open-cron}", zone = "UTC", scheduler = "settlementScheduler")
     public void openDailyTournament() {
-        lifecycle.ensureTournamentFor(time.now());
+        reconcileTournaments();
     }
 
-    /** Also ends any tournament an earlier run missed (instance down at 20:00). */
-    @Scheduled(cron = "${game.tournament.close-cron}", zone = "UTC")
+    @Scheduled(cron = "${game.tournament.close-cron}", zone = "UTC", scheduler = "settlementScheduler")
     public void closeDailyTournament() {
-        lifecycle.endOverdue(time.now());
+        reconcileTournaments();
+    }
+
+    /**
+     * Makes sure today's tournament exists and every tournament past its end is settled (ranks,
+     * rewards, refunds). The 00:00 and 20:00 jobs do this on time; running it every minute too
+     * means a failure then (Postgres briefly down, say) is repaired a minute later instead of the
+     * next day. Both steps are idempotent, so running them often is safe: an ended tournament is
+     * never ended twice.
+     */
+    @Scheduled(initialDelayString = "${game.tournament.reconcile-every:PT1M}",
+               fixedDelayString = "${game.tournament.reconcile-every:PT1M}", scheduler = "settlementScheduler")
+    public void reconcileTournaments() {
+        Instant now = time.now();
+        try {
+            lifecycle.ensureTournamentFor(now);
+        } catch (RuntimeException ex) {
+            log.error("Could not make sure today's tournament exists, will retry: {}", ex.getMessage());
+        }
+        try {
+            lifecycle.endOverdue(now);
+        } catch (RuntimeException ex) {
+            log.error("Could not settle overdue tournaments, will retry: {}", ex.getMessage());
+        }
     }
 
     /**
@@ -47,9 +79,7 @@ public class TournamentJobs {
     @EventListener(ApplicationReadyEvent.class)
     @Order(Ordered.HIGHEST_PRECEDENCE) // before the search reconcile, which waits on Elasticsearch
     public void onStartup() {
-        Instant now = time.now();
-        lifecycle.ensureTournamentFor(now);
-        lifecycle.endOverdue(now);
+        reconcileTournaments();
         tournaments.findByStatus(Tournament.Status.ACTIVE)
                 .forEach(t -> leaderboards.rebuildIfMissing(t.getId()));
     }

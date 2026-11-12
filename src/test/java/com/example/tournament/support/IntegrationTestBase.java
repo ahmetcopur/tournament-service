@@ -256,6 +256,15 @@ public abstract class IntegrationTestBase {
         REDIS.getDockerClient().unpauseContainerCmd(REDIS.getContainerId()).exec();
     }
 
+    /** Freezes Elasticsearch (docker pause): requests hang until {@link #unpauseElasticsearch()}. */
+    protected static void pauseElasticsearch() {
+        ELASTICSEARCH.getDockerClient().pauseContainerCmd(ELASTICSEARCH.getContainerId()).exec();
+    }
+
+    protected static void unpauseElasticsearch() {
+        ELASTICSEARCH.getDockerClient().unpauseContainerCmd(ELASTICSEARCH.getContainerId()).exec();
+    }
+
     /**
      * Holds a row lock in a separate transaction until the returned handle is closed, so a
      * request touching that row has to wait. Use the lock a real competitor would take: for a

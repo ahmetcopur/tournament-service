@@ -9,6 +9,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.example.tournament.support.IntegrationTestBase;
 import com.example.tournament.user.UserRepository;
 import com.fasterxml.jackson.databind.JsonNode;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,7 +39,9 @@ class PlayerSearchIntegrationTest extends IntegrationTestBase {
                 .content("{\"username\":\"" + username + "\"}")).andExpect(status().isCreated()));
     }
 
-    private void refresh() {
+    /** Indexing runs in the background now: wait for queued sign-ups, then make them searchable. */
+    private void refresh() throws Exception {
+        search.awaitIndexed(Duration.ofSeconds(10));
         elasticsearch.indexOps(PlayerDocument.class).refresh();
     }
 
@@ -161,7 +164,7 @@ class PlayerSearchIntegrationTest extends IntegrationTestBase {
     }
 
     @Test
-    void reconcileOnlyExaminesIdRangesThatDiffer() {
+    void reconcileOnlyExaminesIdRangesThatDiffer() throws Exception {
         // Three players in three different ranges of 10,000 ids.
         for (long id : List.of(5L, 15_005L, 30_005L)) {
             jdbc.update("INSERT INTO users (id, username, country) VALUES (?, ?, 'TR')", id, "ranged" + id);
@@ -175,6 +178,32 @@ class PlayerSearchIntegrationTest extends IntegrationTestBase {
         elasticsearch.save(PlayerDocument.of(15_005L, "someone-else", "TR"));
         refresh();
         assertThat(search.reconcileReport()).extracting("rangesExamined", "written").containsExactly(1, 1L);
+    }
+
+    /**
+     * Review finding: indexing ran in the sign-up request (an after-commit listener runs on the
+     * request thread). With Elasticsearch stalled, the player was already committed but the
+     * response hung until the search timeout; a client giving up then never got its token.
+     */
+    @Test
+    void signUpDoesNotWaitForAStalledElasticsearch() throws Exception {
+        JsonNode player;
+        long millis;
+        pauseElasticsearch();
+        try {
+            long started = System.nanoTime();
+            player = signUp("stalled_search");
+            millis = (System.nanoTime() - started) / 1_000_000;
+        } finally {
+            unpauseElasticsearch();
+        }
+        assertThat(player.get("token").asText()).isNotBlank();
+        assertThat(millis).as("sign-up time with Elasticsearch frozen, in ms").isLessThan(500);
+
+        // Once Elasticsearch is back the player becomes searchable (the indexer or the reconcile).
+        search.reconcile();
+        refresh();
+        find("q=stalled_search").andExpect(jsonPath("$[0].id").value(player.get("id").asLong()));
     }
 
     @Test

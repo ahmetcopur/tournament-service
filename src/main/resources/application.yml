@@ -63,6 +63,7 @@ game:
     rewards: [10000, 5000]                  # by final rank: 1st, 2nd, ...
     open-cron: "0 0 0 * * *"                # keep in step with opens-at
     close-cron: "0 0 20 * * *"              # keep in step with closes-at
+    reconcile-every: PT1M                   # settle anything overdue that a daily job missed
   leaderboard:
     ttl-after-end: 2d
     retry-every: PT5S     # re-apply groups whose Redis write failed
