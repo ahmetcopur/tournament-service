@@ -408,6 +408,14 @@ held without skipping a request; at 1,250 to 1,500 it fell behind during latency
 | Rank | 1.0 ms | 7.4 ms | 152.5 ms |
 | Country leaderboard | 0.4 ms | 3.1 ms | 87.1 ms |
 
+Throughput is limited by the app, not by Postgres or Redis: at 1,000 requests/s the app used 1.8
+CPU cores, Postgres under half a core and Redis under a tenth. Almost every request borrows one of
+the 20 Postgres connections, and at that rate requests waited 4.4 ms on average to get one, longer
+than the 2.0 ms they then held it. Spring Security and Micrometer appear in about a fifth of the
+app's CPU samples, and turning off only Spring Security's observations
+(`management.observations.enable.spring.security=false`) cut the app's CPU per request by 9% in one
+run.
+
 ## Known limits
 
 These are fine for a demo and must be decided before real players use it.
