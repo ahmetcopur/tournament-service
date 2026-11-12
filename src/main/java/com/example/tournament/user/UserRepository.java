@@ -1,5 +1,6 @@
 package com.example.tournament.user;
 
+import java.util.List;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
@@ -13,6 +14,9 @@ import org.springframework.data.repository.query.Param;
 public interface UserRepository extends JpaRepository<User, Long> {
 
     boolean existsByUsername(String username);
+
+    /** Keyset pagination for re-indexing players into Elasticsearch. */
+    List<User> findTop500ByIdGreaterThanOrderByIdAsc(long id);
 
     /** Serialises joins for one user, so the entry checks below see committed state. */
     @Query(value = "SELECT * FROM users WHERE id = :id FOR UPDATE", nativeQuery = true)
@@ -46,13 +50,13 @@ public interface UserRepository extends JpaRepository<User, Long> {
             """, nativeQuery = true)
     int claimRewards(@Param("id") long id);
 
-    /** Gives the entry fee back to everyone whose group never filled up. */
+    /** Gives everyone whose group never filled up back exactly the fee they paid. */
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query(value = """
-            UPDATE users u SET coins = u.coins + :fee
+            UPDATE users u SET coins = u.coins + m.entry_fee
             FROM group_members m
             JOIN tournament_groups g ON g.id = m.group_id
             WHERE m.user_id = u.id AND g.tournament_id = :tournamentId AND g.started_at IS NULL
             """, nativeQuery = true)
-    int refundUnstartedEntries(@Param("tournamentId") long tournamentId, @Param("fee") long fee);
+    int refundUnstartedEntries(@Param("tournamentId") long tournamentId);
 }

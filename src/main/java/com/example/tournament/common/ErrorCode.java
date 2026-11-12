@@ -20,6 +20,7 @@ public enum ErrorCode {
     VALIDATION_ERROR(HttpStatus.BAD_REQUEST, "Invalid request"),
     NOT_FOUND(HttpStatus.NOT_FOUND, "No such endpoint"),
     CONFLICT(HttpStatus.CONFLICT, "Conflicting update, please retry"),
+    SEARCH_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "Player search is unavailable right now"),
     INTERNAL_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "Unexpected error");
 
     private final HttpStatus status;

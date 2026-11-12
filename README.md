@@ -4,8 +4,8 @@ Spring Boot backend for a match-3 game. Players pass levels to earn coins, join 
 tournament in groups of five (one player per country), and compete on live group and country
 leaderboards.
 
-Java 21 · Spring Boot 3.5 · Spring Data JPA · PostgreSQL 16 · Redis 7 · Flyway · Docker Compose ·
-JUnit 5 + Testcontainers · k6 · Actuator + Prometheus
+Java 21 · Spring Boot 3.5 · Spring Data JPA · PostgreSQL 16 · Redis 7 · Elasticsearch 8 · Flyway ·
+Docker Compose · JUnit 5 + Testcontainers · k6 · Actuator + Prometheus
 
 ## Run it
 
@@ -24,11 +24,12 @@ TOURNAMENT_CLOSES_AT=24h docker compose up --build
 From an IDE (JDK 21): start only the databases, then run the app.
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d postgres redis elasticsearch
 ./mvnw spring-boot:run
 ```
 
 Postgres is published on host port **5433** so it doesn't clash with a local Postgres.
+Elasticsearch runs with security off, which is fine on a laptop and nowhere else.
 
 A quick tour:
 
@@ -56,6 +57,7 @@ curl -s -XPOST localhost:8080/tournaments/current/entries -H 'Content-Type: appl
 | GET | `/tournaments/{id}/users/{userId}/rank` | | `{rank}` inside the user's group |
 | GET | `/tournaments/{id}/countries/leaderboard` | | `[{country, score}]` |
 | GET | `/tournaments/current` | | `{id, startsAt, endsAt, status, open}` *(added)* |
+| GET | `/users/search?q=ahm&country=TR&limit=20` | | `[User]`, best match first *(added)* |
 
 | Code | HTTP | When |
 |---|---|---|
@@ -68,10 +70,11 @@ curl -s -XPOST localhost:8080/tournaments/current/entries -H 'Content-Type: appl
 | `NO_REWARD` | 404 | Nothing to claim |
 | `USERNAME_TAKEN` | 409 | *(added)* Username exists |
 | `GROUP_NOT_FOUND`, `TOURNAMENT_NOT_FOUND`, `NOT_IN_TOURNAMENT` | 404 | *(added)* Unknown ids on leaderboard reads |
-| `VALIDATION_ERROR` | 400 | *(added)* Bad body or path |
+| `VALIDATION_ERROR` | 400 | *(added)* Bad body, path or query |
+| `SEARCH_UNAVAILABLE` | 503 | *(added)* Elasticsearch can't be reached; everything else still works |
 
 Metrics: `GET /actuator/prometheus` (HTTP latency histograms, plus
-`leaderboard_redis_write_failures_total`).
+`leaderboard_redis_write_failures_total` and `search_index_failures_total`).
 
 ## Game rules
 
@@ -86,6 +89,7 @@ All in [application.yml](src/main/resources/application.yml) under `game.*`; no 
 | Entry | `tournament.min-level` / `entry-fee` | level 20, 1,000 coins |
 | Rewards by rank | `tournament.rewards` | 10,000, 5,000 |
 | Redis key lifetime | `leaderboard.ttl-after-end` | 2 days after the tournament ends |
+| Search index check | `search.reconcile-every` | every 10 minutes |
 
 ## How the hard parts work
 
@@ -107,16 +111,40 @@ player's group is `ACTIVE`, the group row share-locked. Redis is updated in an
 **End of day** ([TournamentLifecycleService](src/main/java/com/example/tournament/tournament/TournamentLifecycleService.java)).
 One transaction: mark the tournament `ENDED` (waits for in-flight joins), end every group (waits
 for in-flight level ups), rank full groups by score then by who reached it first, pay ranks 1 and 2,
-and refund the fee to players whose group never filled. Ranks come from Postgres, so a Redis
+and refund players whose group never filled exactly the fee each one paid (stored on the entry,
+so a fee change mid-day doesn't matter). Ranks come from Postgres, so a Redis
 problem can't hand out wrong rewards. Running it twice, or on two instances, does nothing the
 second time. On startup the app creates today's row if it's missing and ends any tournament
 whose window has already passed.
 
-**Redis and Postgres drifting apart.** Postgres is the source of truth. Reads fall back to
-Postgres when Redis is down or a board is missing or incomplete, and a group board read from
-Postgres is written back to Redis. A missing country board is rebuilt from Postgres sums. At
-20:00 all boards are rewritten from the final Postgres values. At startup, missing boards for
-open tournaments are rebuilt.
+**Redis and Postgres drifting apart.** Postgres is the source of truth, and every Redis write is
+idempotent, so a write can be retried, arrive late, or race a rebuild without counting a point twice
+or losing one.
+
+- *Group boards* keep each player's highest value (`ZADD GT`). If a board is missing or
+  incomplete, the read is answered from Postgres and the board is written back.
+- *Country boards* ([country_apply.lua](src/main/resources/redis/country_apply.lua)) store, next to
+  the totals, the highest score already counted for each player. An update says "player 42 is at
+  score 7"; only the part not yet counted is added. A rebuild replays every player's Postgres score
+  through the same script and then marks the board complete. Every update committed before the
+  rebuild's Postgres read is in the replay, and every later one applies itself, so the board ends up
+  exact. Rebuilds run one at a time per tournament (a Redis lock), and until a board is complete,
+  reads come from Postgres.
+- At 20:00 and at startup, boards are rebuilt from Postgres.
+
+**Redis Cluster.** Every command touches one key, or keys sharing a hash tag: a tournament's
+country board `lb:country:{7}` and its bookkeeping `lb:country:{7}:applied` sit in one slot, so
+the script can update both atomically. Group boards are independent keys and spread across nodes.
+The tests run Redis in cluster mode, which rejects any cross-slot command, so the suite checks this
+on every run. Switching is configuration only: set `spring.data.redis.cluster.nodes`.
+
+**Player search** ([PlayerSearchService](src/main/java/com/example/tournament/search/PlayerSearchService.java)).
+Elasticsearch holds only what people search by (id, username, country), written once at sign up
+after the commit. Results rank the exact name first, then names starting with the query
+(edge n-grams), then names within a typo or two (fuzzy). Level and coins come fresh from Postgres
+for the ids found, so level ups never touch Elasticsearch. A failed index write never fails a sign
+up. At startup and every 10 minutes, a reconcile job re-indexes from Postgres if the index has
+fewer players than the database. If Elasticsearch is down, only search returns 503.
 
 **Ties.** A Redis sorted set holds one double per member, so score and time are packed into one
 value: `score × 10^9 + (10^9 − 1 − ms since tournament start)`. A higher score always wins, and
@@ -148,17 +176,20 @@ with equal scores the earlier time wins, matching the 20:00 ranking in Postgres
    ties by user id and Postgres by time.
 7. **`ZADD GT` instead of plain `ZADD`.** After-commit listeners for two level ups run on
    different request threads and can reach Redis out of order; `GT` never moves a player back.
-8. **Country board rebuilt, not incremented from zero.** If `lb:country:{id}` is missing (wiped or
-   expired), the Lua script skips `ZINCRBY` and the app rebuilds the board from Postgres sums.
-   Otherwise a wiped board would restart from 0.
+8. **Exact country board instead of plain `ZINCRBY`.** A `+1` can't be retried safely, so after
+   a wipe nothing could tell which in-flight increments a rebuild already held. The board now
+   tracks the score counted per player and applies absolute scores (see above). The key has a hash
+   tag, `lb:country:{tournamentId}`, so it shares a cluster slot with its bookkeeping hash.
 9. **After-commit reads reuse the request's connection.** At first the rebuild read used
    `REQUIRES_NEW`. During an after-commit callback Spring still holds the request's connection, so
    each request needed a second one. In the 200-thread test, all 20 pooled connections were held
    by requests waiting for another, and joins timed out after 30 s. Propagation `REQUIRED` fixed it
    ([LeaderboardWriter](src/main/java/com/example/tournament/leaderboard/LeaderboardWriter.java)).
-10. **Small additions:** `GET /tournaments/current`, the extra error codes above, named
-    constraints (mapped to error codes), and indexes for the level-up lookup, the unclaimed-reward
-    check and the end-of-day queries.
+10. **The entry fee is stored per entry** (`group_members.entry_fee`, migration V2), so refunds
+    return what each player paid, not the fee configured at 20:00.
+11. **Small additions:** `GET /tournaments/current`, player search, the extra error codes above,
+    named constraints (mapped to error codes), and indexes for the level-up lookup, the
+    unclaimed-reward check and the end-of-day queries.
 
 ## Tests
 
@@ -166,15 +197,21 @@ with equal scores the earlier time wins, matching the 20:00 ranking in Postgres
 ./mvnw test        # needs Docker for Testcontainers
 ```
 
-35 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
-Postgres and Redis containers:
+47 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
+Postgres, Redis (in cluster mode) and Elasticsearch containers:
 
 - **Users:** create, duplicate name, validation, level up.
 - **Joining:** each entry rule and error code, group fill to `ACTIVE`, same country going to
   another group, score counting only once the group is full.
 - **Leaderboards:** order with tie-break, rank, country sums, Redis wipe recovery, key expiry.
-- **End of day:** ranks, rewards, refunds, idempotency, no points after 20:00, claims (including
-  10 concurrent claims paying once), unclaimed reward blocking the next day.
+- **Country board exactness:** retried and out-of-order updates, late updates after a wipe, reads
+  while another instance rebuilds, half a board evicted, and 600 concurrent level ups with Redis
+  wiped halfway (the board still equals the Postgres sums).
+- **End of day:** ranks, rewards, refunds of the fee actually paid, idempotency, no points after
+  20:00, claims (including 10 concurrent claims paying once), unclaimed reward blocking the next
+  day.
+- **Search:** prefix, exact match first, typos, country filter, limit, fresh level from Postgres,
+  reconcile of players missing from the index, bad parameters.
 - **Concurrency:** 200 players joining at once. No group has two players from one country,
   everyone was charged exactly once, group counts match members, and every `ACTIVE` group is in
   Redis. Also one player sending 20 joins at once: charged once.
@@ -192,35 +229,40 @@ docker run --rm -i --network tournament-service_default -v "$PWD/load-test":/loa
 ```
 
 Results from 2026-11-11, on an Apple Silicon laptop. Docker Desktop had 8 CPUs and 4 GB, and the
-app, Postgres, Redis and k6 all shared that VM. Hikari pool 20, default Tomcat settings.
+app, Postgres, Redis, Elasticsearch and k6 all shared that VM. Hikari pool 20, default Tomcat
+settings. Every run had 0 failed requests. After the 400 and 1,500 requests/s runs, the country
+board in Redis matched the Postgres sums exactly, with both failure counters at 0.
 
-**400 requests/s for 60 s** (29,252 requests, 0 failed):
+Tail latency on a laptop depends mostly on what else the machine is doing. These runs were made
+while it was busy (load average about 5):
 
-| Endpoint | p50 | p99 |
-|---|---|---|
-| Level up (Postgres transaction + Redis script) | 1.2 ms | 3.7 ms |
-| Group leaderboard | 0.9 ms | 2.9 ms |
-| Rank | 1.8 ms | 4.7 ms |
-| Country leaderboard | 0.3 ms | 1.2 ms |
+| 400 requests/s for 60 s | p50 | p90 | p99 |
+|---|---|---|---|
+| Level up (Postgres transaction + 2 Redis scripts) | 1.9 ms | 6.0 ms | 99.6 ms |
+| Group leaderboard | 1.3 ms | 4.1 ms | 70.9 ms |
+| Rank | 2.4 ms | 6.8 ms | 84.2 ms |
+| Country leaderboard | 0.6 ms | 2.0 ms | 40.9 ms |
 
-**1,500 requests/s for 30 s** (50,049 requests, 0 failed):
+| 1,500 requests/s for 30 s | p50 | p90 | p99 |
+|---|---|---|---|
+| Level up | 1.4 ms | 12.0 ms | 296.6 ms |
+| Group leaderboard | 0.7 ms | 5.4 ms | 272.8 ms |
+| Rank | 1.4 ms | 9.2 ms | 283.4 ms |
+| Country leaderboard | 0.4 ms | 3.4 ms | 142.5 ms |
 
-| Endpoint | p50 | p99 |
-|---|---|---|
-| Level up | 1.1 ms | 9.4 ms |
-| Group leaderboard | 0.6 ms | 6.3 ms |
-| Rank | 1.1 ms | 8.7 ms |
-| Country leaderboard | 0.3 ms | 3.3 ms |
+For comparison, the previous version (one Redis script per level up, no exact country board, no
+Elasticsearch) was run right before this one on the same busy machine. At 400 requests/s it
+measured the same p50 (1.9 ms) and a worse p99 (299 ms). Earlier, on a quiet machine, it had a
+p99 under 5 ms on every endpoint. The medians are stable; the tail is the laptop.
 
-After the 400/s run, Redis matched Postgres exactly: all 205 scored members and all five country
-totals, with `leaderboard_redis_write_failures_total` at 0.
+## Known limits
 
-## Not done / known limits
-
-- **Elasticsearch player search** (an optional extra in the plan) is not built.
-- **Redis Cluster:** the level-up script touches a group key and a country key, which can sit in
-  different hash slots. For a cluster, give both keys a common hash tag or split the script.
-- **Country board during a wipe recovery** can be off by a few points while increments are in
-  flight. Group boards heal exactly, and the 20:00 rewrite makes country totals exact.
-- **Refunds use the current `entry-fee`.** Changing the fee mid-day refunds the new amount.
-  Storing the paid fee per member would fix it.
+- **Rebuilds read a whole tournament at once.** A country board rebuild loads every player in a
+  full group into memory and replays them in batches of 500. That's fine for tens of thousands of
+  players; for millions, page through Postgres instead.
+- **The country board is one hot key per tournament.** Every scoring level up touches it, so on a
+  cluster that slot's node takes all country traffic. Group boards spread out.
+- **The bookkeeping hash grows by one field per player in a full group** (about 50 bytes each),
+  and expires with the board.
+- **Elasticsearch security is off** in Compose. Turn it on, with TLS and credentials
+  (`spring.elasticsearch.username`/`password`), anywhere other than a laptop.

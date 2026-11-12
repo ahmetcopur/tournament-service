@@ -28,6 +28,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.elasticsearch.ElasticsearchContainer;
 
 /**
  * Real Postgres and Redis in containers, started once and shared by every test class.
@@ -41,12 +42,42 @@ public abstract class IntegrationTestBase {
     @ServiceConnection
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
 
+    /**
+     * Redis in cluster mode, as a single node that owns all 16,384 slots. The app talks to it as a
+     * plain server, but the node still rejects any command whose keys sit in different slots
+     * (CROSSSLOT), so every test also proves the app is safe to run on a Redis Cluster.
+     */
     @ServiceConnection(name = "redis")
-    static final GenericContainer<?> REDIS = new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
+    static final GenericContainer<?> REDIS = new GenericContainer<>("redis:7-alpine")
+            .withExposedPorts(6379)
+            .withCommand("redis-server", "--cluster-enabled", "yes", "--save", "", "--appendonly", "no");
+
+    @ServiceConnection
+    static final ElasticsearchContainer ELASTICSEARCH =
+            new ElasticsearchContainer("docker.elastic.co/elasticsearch/elasticsearch:8.18.8")
+                    .withEnv("xpack.security.enabled", "false")
+                    .withEnv("ES_JAVA_OPTS", "-Xms512m -Xmx512m");
 
     static {
         POSTGRES.start();
         REDIS.start();
+        assignAllSlots(REDIS);
+        ELASTICSEARCH.start();
+    }
+
+    private static void assignAllSlots(GenericContainer<?> redis) {
+        try {
+            redis.execInContainer("redis-cli", "cluster", "addslotsrange", "0", "16383");
+            for (int i = 0; i < 100; i++) {
+                if (redis.execInContainer("redis-cli", "cluster", "info").getStdout().contains("cluster_state:ok")) {
+                    return;
+                }
+                Thread.sleep(100);
+            }
+            throw new IllegalStateException("Redis cluster did not become ready");
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not set up the Redis cluster node", e);
+        }
     }
 
     /**

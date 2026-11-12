@@ -10,6 +10,7 @@ import com.example.tournament.tournament.TournamentGroupRepository;
 import com.example.tournament.tournament.TournamentRepository;
 import com.example.tournament.user.User;
 import com.example.tournament.user.UserRepository;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -19,11 +20,13 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataAccessException;
 import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations.TypedTuple;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 /**
@@ -43,6 +46,9 @@ public class LeaderboardService {
     private final TournamentRepository tournaments;
     private final LeaderboardWriter writer;
     private final GameProperties props;
+    @SuppressWarnings("rawtypes")
+    private final RedisScript<List> countryReadScript =
+            RedisScript.of(new ClassPathResource("redis/country_read.lua"), List.class);
 
     public LeaderboardService(StringRedisTemplate redis, UserRepository users, GroupMemberRepository members,
                               TournamentGroupRepository groups, TournamentRepository tournaments,
@@ -105,11 +111,17 @@ public class LeaderboardService {
         throw new ApiException(ErrorCode.NOT_IN_TOURNAMENT);
     }
 
+    /** From Redis only when the board is complete; while it is missing or being rebuilt, from Postgres. */
+    @SuppressWarnings("unchecked")
     public List<CountryScore> countryLeaderboard(long tournamentId) {
-        Set<TypedTuple<String>> board =
-                fromRedis(() -> redis.opsForZSet().reverseRangeWithScores(LeaderboardKeys.country(tournamentId), 0, -1));
-        if (board != null && !board.isEmpty()) {
-            return board.stream().map(t -> new CountryScore(t.getValue(), t.getScore().longValue())).toList();
+        List<String> flat = fromRedis(() -> (List<String>) redis.execute(countryReadScript,
+                List.of(LeaderboardKeys.country(tournamentId), LeaderboardKeys.countryApplied(tournamentId))));
+        if (flat != null && !flat.isEmpty()) {
+            List<CountryScore> board = new ArrayList<>(flat.size() / 2);
+            for (int i = 0; i + 1 < flat.size(); i += 2) {
+                board.add(new CountryScore(flat.get(i), (long) Double.parseDouble(flat.get(i + 1))));
+            }
+            return board;
         }
         if (!tournaments.existsById(tournamentId)) {
             throw new ApiException(ErrorCode.TOURNAMENT_NOT_FOUND);

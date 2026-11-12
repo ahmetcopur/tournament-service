@@ -6,6 +6,7 @@ import com.example.tournament.config.GameProperties;
 import com.example.tournament.config.TimeSource;
 import com.example.tournament.tournament.ScoringService;
 import java.time.Instant;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -17,14 +18,16 @@ public class UserService {
     private final CountryPicker countryPicker;
     private final GameProperties props;
     private final TimeSource time;
+    private final ApplicationEventPublisher events;
 
     public UserService(UserRepository users, ScoringService scoring, CountryPicker countryPicker,
-                       GameProperties props, TimeSource time) {
+                       GameProperties props, TimeSource time, ApplicationEventPublisher events) {
         this.users = users;
         this.scoring = scoring;
         this.countryPicker = countryPicker;
         this.props = props;
         this.time = time;
+        this.events = events;
     }
 
     @Transactional
@@ -33,7 +36,9 @@ public class UserService {
             throw new ApiException(ErrorCode.USERNAME_TAKEN);
         }
         // A racing insert with the same name still fails on uq_users_username.
-        return users.saveAndFlush(new User(username, countryPicker.pick(), props.startingCoins(), time.now()));
+        User user = users.saveAndFlush(new User(username, countryPicker.pick(), props.startingCoins(), time.now()));
+        events.publishEvent(new UserCreated(user.getId(), user.getUsername(), user.getCountry()));
+        return user;
     }
 
     @Transactional(readOnly = true)

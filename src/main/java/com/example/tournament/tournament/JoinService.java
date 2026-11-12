@@ -71,19 +71,21 @@ public class JoinService {
         if (user.getLevel() < rules.minLevel()) {
             throw new ApiException(ErrorCode.LEVEL_TOO_LOW);
         }
-        if (user.getCoins() < rules.entryFee()) {
+        long fee = rules.entryFee();
+        if (user.getCoins() < fee) {
             throw new ApiException(ErrorCode.NOT_ENOUGH_COINS);
         }
 
         // The fee goes first, as one conditional UPDATE. The checks above give precise error codes;
         // this statement is what actually guarantees the rule.
-        if (users.chargeEntryFee(userId, rules.entryFee(), rules.minLevel()) == 0) {
+        if (users.chargeEntryFee(userId, fee, rules.minLevel()) == 0) {
             throw new ApiException(ErrorCode.NOT_ENOUGH_COINS);
         }
 
         TournamentGroup group = lockGroupWithRoomFor(tournament.getId(), user.getCountry())
                 .orElseGet(() -> groups.saveAndFlush(TournamentGroup.waiting(tournament.getId())));
-        members.saveAndFlush(new GroupMember(group.getId(), tournament.getId(), userId, user.getCountry(), now));
+        // Record the fee actually charged, so a refund returns exactly that.
+        members.saveAndFlush(new GroupMember(group.getId(), tournament.getId(), userId, user.getCountry(), fee, now));
         boolean filled = group.addMember(props.groupSize(), now);
         groups.saveAndFlush(group);
 

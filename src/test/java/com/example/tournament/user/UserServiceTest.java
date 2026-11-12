@@ -23,6 +23,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.context.ApplicationEventPublisher;
 
 @ExtendWith(MockitoExtension.class)
 class UserServiceTest {
@@ -35,6 +36,8 @@ class UserServiceTest {
     private ScoringService scoring;
     @Mock
     private CountryPicker countryPicker;
+    @Mock
+    private ApplicationEventPublisher events;
 
     private UserService service;
 
@@ -45,7 +48,7 @@ class UserServiceTest {
                         List.of(10_000L, 5_000L)),
                 new GameProperties.LeaderboardRules(Duration.ofDays(2)));
         service = new UserService(users, scoring, countryPicker, props,
-                new TimeSource(Clock.fixed(NOW, ZoneOffset.UTC)));
+                new TimeSource(Clock.fixed(NOW, ZoneOffset.UTC)), events);
     }
 
     @Test
