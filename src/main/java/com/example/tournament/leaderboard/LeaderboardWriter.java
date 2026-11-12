@@ -23,8 +23,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
+import jakarta.annotation.PreDestroy;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
@@ -88,6 +93,8 @@ public class LeaderboardWriter {
     private final String allCountries;
     /** Groups whose Redis write failed after commit (group id -> tournament id), retried from Postgres. */
     private final ConcurrentMap<Long, Long> missedGroups = new ConcurrentHashMap<>();
+    /** Final rebuilds, off the settlement thread. One at a time; the queue holds about a day each. */
+    private final ExecutorService finalizer;
     private final RedisScript<Long> upsertGroupScript =
             RedisScript.of(new ClassPathResource("redis/upsert_group.lua"), Long.class);
     private final RedisScript<Long> countryApplyScript =
@@ -128,6 +135,13 @@ public class LeaderboardWriter {
         this.countryRebuilds = Counter.builder("leaderboard.country.rebuilds")
                 .description("Country boards rebuilt from Postgres (start of a tournament, Redis data loss, 20:00)")
                 .register(meters);
+        this.finalizer = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(100),
+                task -> {
+                    Thread thread = new Thread(task, "leaderboard-finalizer");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                (task, executor) -> log.warn("Final rebuild queue is full; the re-apply job will finalize the tournament"));
     }
 
     // ---------------------------------------------------------------- live updates (after commit)
@@ -167,12 +181,30 @@ public class LeaderboardWriter {
     }
 
     /**
-     * After 20:00 nothing changes any more; make sure every board holds the final values. If this
-     * fails, the tournament stays unfinalized in Postgres and {@link #reapplyTournaments()} retries.
+     * After 20:00 nothing changes any more; make sure every board holds the final values.
+     *
+     * <p>Hands the work to the finalizer thread instead of doing it here: this listener runs on the
+     * settlement thread right after the Postgres commit, and a full Redis rebuild of a big
+     * tournament (or a slow Redis) would hold settlement of the next tournament hostage. It's safe
+     * to do asynchronously because the tournament only counts as finalized once
+     * {@code boards_finalized_at} is set; if the worker fails, its queue is full, or the process
+     * dies, {@link #reapplyTournaments()} finishes the job.
      */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onTournamentEnded(TournamentEnded event) {
-        guarded("final rebuild of tournament " + event.tournamentId(), () -> finalizeBoards(event.tournamentId()));
+        long tournamentId = event.tournamentId();
+        finalizer.execute(() -> guarded("final rebuild of tournament " + tournamentId, () -> finalizeBoards(tournamentId)));
+    }
+
+    /** Waits until every final rebuild queued so far has finished (or failed). For tests. */
+    public void awaitFinalization(Duration timeout) throws Exception {
+        finalizer.submit(() -> { }).get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    @PreDestroy
+    void stopFinalizer() throws InterruptedException {
+        finalizer.shutdown();
+        finalizer.awaitTermination(30, TimeUnit.SECONDS);
     }
 
     // ---------------------------------------------------------------- repair

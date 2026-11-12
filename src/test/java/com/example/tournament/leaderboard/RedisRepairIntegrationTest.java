@@ -117,7 +117,7 @@ class RedisRepairIntegrationTest extends IntegrationTestBase {
         redis.delete(firstKey);
         redis.opsForValue().set(firstKey, "broken");
         clock.set(CLOSING_TIME);
-        lifecycle.endOverdue(clock.instant());
+        settle();
         assertThat(redisGroupScore(second.groupId(), de)).as("stale after the failed final rebuild").isEqualTo(1);
         assertThat(boardsFinalizedAt(t.getId())).as("failure leaves the tournament unfinalized").isNull();
 

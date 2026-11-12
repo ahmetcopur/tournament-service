@@ -5,6 +5,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 
 import com.example.tournament.TournamentApplication;
 import com.example.tournament.leaderboard.CountryBoardLayout;
+import com.example.tournament.leaderboard.LeaderboardWriter;
 import com.example.tournament.security.TokenService;
 import com.example.tournament.tournament.Tournament;
 import com.example.tournament.tournament.TournamentLifecycleService;
@@ -122,9 +123,12 @@ public abstract class IntegrationTestBase {
     protected TokenService tokens;
     @Autowired
     protected CountryBoardLayout layout;
+    @Autowired
+    protected LeaderboardWriter boardWriter;
 
     @BeforeEach
-    void resetState() {
+    void resetState() throws Exception {
+        boardWriter.awaitFinalization(Duration.ofSeconds(60)); // no background rebuild from the last test
         jdbc.execute("TRUNCATE group_members, tournament_groups, tournaments, users");
         flushRedis();
         clock.set(MORNING);
@@ -135,6 +139,13 @@ public abstract class IntegrationTestBase {
             c.serverCommands().flushAll();
             return null;
         });
+    }
+
+    /** Ends every overdue tournament, then waits for the final board rebuilds (they run in the background). */
+    protected int settle() throws Exception {
+        int ended = lifecycle.endOverdue(clock.instant());
+        boardWriter.awaitFinalization(Duration.ofSeconds(60));
+        return ended;
     }
 
     protected Tournament openTournament() {

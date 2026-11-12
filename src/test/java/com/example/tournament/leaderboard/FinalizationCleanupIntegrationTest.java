@@ -47,7 +47,7 @@ class FinalizationCleanupIntegrationTest extends IntegrationTestBase {
         // Redis fails exactly when the final cleanup deletes the bookkeeping.
         doThrow(new RedisSystemException("Redis went away during cleanup", null)).when(redisSpy).delete(anyCollection());
         clock.set(CLOSING_TIME);
-        lifecycle.endOverdue(clock.instant());
+        settle();
 
         assertThat(redis.hasKey(bookkeeping)).as("cleanup failed").isTrue();
         assertThat(boardsFinalizedAt(t.getId())).as("not recorded as finalized while cleanup is unfinished").isNull();

@@ -200,9 +200,10 @@ or losing one.
   lock that expires). It sends only scores changed and groups filled since its previous run, plus a
   minute of margin; the first run, or one after Redis lost data, does everything. A timeout doesn't
   even mean the write was lost: it can land late, and the retry applying it again changes nothing.
-- At 20:00 and at startup, boards are rebuilt from Postgres. Finalization rebuilds the boards,
-  deletes the bookkeeping, and only then records `tournaments.boards_finalized_at`, so the marker
-  means "rebuilt and cleaned up". If any step fails (Redis down at 20:00, the instance dies part
+- At 20:00 and at startup, boards are rebuilt from Postgres. The final rebuild runs on its own
+  background worker, not the settlement thread, so a big tournament or a slow Redis never delays
+  the next settlement. Finalization rebuilds the boards, deletes the bookkeeping, and only then
+  records `tournaments.boards_finalized_at`, so the marker means "rebuilt and cleaned up". If any step fails (Redis down at 20:00, the instance dies part
   way), the marker stays empty and the 5-minute job retries the whole thing until it succeeds, for
   as long as the boards would still exist. Only those tournaments are retried, never the whole
   history.
@@ -359,6 +360,7 @@ The known limits from the previous version, and what closed each one:
 | Settlement only at 20:00 and startup | A reconcile every minute settles anything overdue; one failing tournament doesn't block others | A Postgres error injected at 20:00: still ACTIVE; a minute later it is settled, with rewards and refunds exactly once |
 | One scheduler thread for every job | Settlement gets its own thread; maintenance shares a pool of two | Settlement keeps running every 50 ms while a maintenance job holds its thread for 3 s |
 | Sign up waited for Elasticsearch | Indexing moved to a background worker; the reconcile retries failures | With Elasticsearch frozen, sign up went from 3,272 ms to under 500 ms; the player is searchable once it's back |
+| Final Redis rebuild ran on the settlement thread | It runs on its own worker; the `boards_finalized_at` marker makes the hand-off safe; overdue tournaments settle oldest first | With every Redis script slowed to 300 ms, two overdue tournaments: the second was still ACTIVE after 2.2 s. Now both settle at once, and both rebuilds still finish in the background |
 | Deployment untested in CI | `scripts/smoke-test.sh` runs against the real Compose stack in CI | 18 checks: HTTPS, 401/403 rules, actuator, Elasticsearch TLS and user, background indexing, localhost-only ports |
 
 ## Tests
@@ -367,7 +369,7 @@ The known limits from the previous version, and what closed each one:
 ./mvnw test        # needs Docker for Testcontainers
 ```
 
-80 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
+81 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
 Postgres, Redis (in cluster mode) and Elasticsearch containers. CI (GitHub Actions) runs them on
 every pull request, then starts the Compose stack and runs
 [scripts/smoke-test.sh](scripts/smoke-test.sh) against it: HTTPS, authentication, Elasticsearch
@@ -398,7 +400,8 @@ security and port bindings, the things unit tests can't see. It runs locally too
   is refused; so does a level up waiting on its group's row; a level up still waiting while the
   20:00 job ranks leaves the ranking alone.
 - **Settlement and scheduling:** a database error at 20:00 is settled by the next reconcile,
-  exactly once; settlement keeps running while a maintenance job is stuck.
+  exactly once; settlement keeps running while a maintenance job is stuck, and while a slow final
+  Redis rebuild is still going.
 - **Search:** prefix, exact match first, typos, country filter, limit, fresh level from Postgres,
   reconcile of players missing from the index, orphaned and wrong documents, identical fingerprints
   in Java and Postgres, only differing ranges examined, sign up with Elasticsearch frozen, bad

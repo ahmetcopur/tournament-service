@@ -14,7 +14,8 @@ public interface TournamentRepository extends JpaRepository<Tournament, Long> {
 
     List<Tournament> findByStatus(Tournament.Status status);
 
-    List<Tournament> findByStatusAndEndsAtLessThanEqual(Tournament.Status status, Instant now);
+    /** Oldest first, so a backlog settles in the order the tournaments ended. */
+    List<Tournament> findByStatusAndEndsAtLessThanEqualOrderByEndsAtAsc(Tournament.Status status, Instant now);
 
     /** Finished tournaments whose final board rebuild hasn't succeeded yet, ended after {@code since}. */
     List<Tournament> findByStatusAndBoardsFinalizedAtIsNullAndEndsAtAfter(Tournament.Status status, Instant since);

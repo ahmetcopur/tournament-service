@@ -61,7 +61,7 @@ public class TournamentLifecycleService {
 
     /** Ends every ACTIVE tournament whose window is over. Safe to run on several instances at once. */
     public int endOverdue(Instant now) {
-        List<Tournament> overdue = tournaments.findByStatusAndEndsAtLessThanEqual(Tournament.Status.ACTIVE, now);
+        List<Tournament> overdue = tournaments.findByStatusAndEndsAtLessThanEqualOrderByEndsAtAsc(Tournament.Status.ACTIVE, now);
         int ended = 0;
         for (Tournament t : overdue) {
             try {

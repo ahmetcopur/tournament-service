@@ -130,7 +130,7 @@ class EndOfDayIntegrationTest extends IntegrationTestBase {
         assertThat(coins(waitingTr)).isEqualTo(4000);
 
         clock.set(CLOSING_TIME);
-        assertThat(lifecycle.endOverdue(clock.instant())).isEqualTo(1);
+        assertThat(settle()).isEqualTo(1);
 
         assertThat(member(us)).containsEntry("final_rank", 1).containsEntry("reward_coins", 10_000);
         assertThat(member(tr)).containsEntry("final_rank", 2).containsEntry("reward_coins", 5_000);

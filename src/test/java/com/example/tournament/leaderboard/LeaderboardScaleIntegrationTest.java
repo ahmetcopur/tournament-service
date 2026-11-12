@@ -83,7 +83,7 @@ class LeaderboardScaleIntegrationTest extends IntegrationTestBase {
     }
 
     @Test
-    void bookkeepingIsCompactWhileOpenAndGoneOnceFinal() {
+    void bookkeepingIsCompactWhileOpenAndGoneOnceFinal() throws Exception {
         Tournament t = bigTournament();
         writer.rebuild(t.getId());
 
@@ -107,7 +107,7 @@ class LeaderboardScaleIntegrationTest extends IntegrationTestBase {
 
         // After 20:00 the final rebuild runs, then the bookkeeping is deleted.
         clock.set(CLOSING_TIME);
-        lifecycle.endOverdue(clock.instant());
+        settle();
         assertThat(bucketKeys).allSatisfy(key -> assertThat(redis.hasKey(key)).as(key).isFalse());
         assertThat(countryBoardComplete(t.getId())).isTrue();
         assertThat(redisCountryTotals(t.getId())).isEqualTo(postgresTotals(t.getId()));
