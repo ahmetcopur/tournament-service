@@ -8,7 +8,7 @@ leaderboards kept in Redis, with Postgres as the source of truth.
   the same country.
 - When one player sends 10 reward claims at once, the reward is paid once.
 - After each load test, every group board and the country board in Redis matched Postgres exactly.
-- Under 400 requests/s on a laptop, level ups took 1.7 ms at p50 and 159 ms at p99.
+- Under 400 requests/s on a laptop, level ups took 1.5 ms at p50 and 8.0 ms at p99.
 - 81 tests run in CI against real Postgres, Redis in cluster mode and Elasticsearch.
 
 Java 21 · Spring Boot 3.5 · Spring Data JPA · PostgreSQL 16 · Redis 7 · Elasticsearch 8 · Flyway ·
@@ -16,17 +16,30 @@ Docker Compose · JUnit 5 + Testcontainers · k6 · Actuator, Prometheus and Gra
 
 ## Run it
 
-Everything in Docker:
-
 ```bash
 docker compose up --build
 ```
 
-The tournament window is 00:00 to 20:00 UTC. To try it after 20:00 UTC, stretch the window:
+Once the app logs `Started TournamentApplication`, try it from a second terminal over plain HTTP
+on this machine (needs `jq`). Sign up returns a token; every other request sends it.
 
 ```bash
-TOURNAMENT_CLOSES_AT=24h docker compose up --build
+API=http://localhost:8080
+ME=$(curl -s $API/users -H 'Content-Type: application/json' -d '{"username":"alice"}')
+ID=$(echo "$ME" | jq -r .id)
+AUTH="Authorization: Bearer $(echo "$ME" | jq -r .token)"
+# Joining needs level 20; every level up also pays 25 coins.
+for i in $(seq 19); do curl -s -o /dev/null -XPOST $API/users/$ID/levels -H "$AUTH"; done
+curl -s -XPOST $API/tournaments/current/entries -H "$AUTH" -H 'Content-Type: application/json' \
+  -d "{\"userId\":$ID}"
 ```
+
+The join returns your group, `WAITING` until one player from each of the five countries is in it,
+then `ACTIVE`; from then on every level up scores a point on the group and country leaderboards.
+The tournament runs from 00:00 to 20:00 UTC. To try it after 20:00 UTC, stretch the window:
+`TOURNAMENT_CLOSES_AT=24h docker compose up --build`.
+
+### HTTPS and local development
 
 Secrets come from a git-ignored `.env` file; [.env.example](.env.example) lists them with
 local-only defaults. Set real values anywhere other than a laptop, above all `AUTH_TOKEN_SECRET`.
@@ -47,22 +60,22 @@ deployment, don't publish those ports at all.
 | 5433 / 6379 | Postgres (5433 so it doesn't clash with a local one) / Redis | this machine only |
 
 Caddy signs its certificates with its own local CA. Take its root once, then call the API the
-way clients do, over HTTPS. Sign up returns a token; every other request sends it.
+way clients do, over HTTPS:
 
 ```bash
 mkdir -p certs && docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt certs/caddy-root.crt
-API="curl -s --cacert certs/caddy-root.crt https://localhost:8443"
-TOKEN=$($API/users -XPOST -H 'Content-Type: application/json' -d '{"username":"alice"}' | jq -r .token)
-$API/users/1/levels -XPOST -H "Authorization: Bearer $TOKEN"
-$API/tournaments/current -H "Authorization: Bearer $TOKEN"
-$API/tournaments/current/entries -XPOST -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -d '{"userId":1}'
+API=https://localhost:8443
+ME=$(curl -s --cacert certs/caddy-root.crt $API/users -H 'Content-Type: application/json' \
+  -d '{"username":"bob"}')
+curl -s --cacert certs/caddy-root.crt $API/users/$(echo "$ME" | jq -r .id) \
+  -H "Authorization: Bearer $(echo "$ME" | jq -r .token)"
 ```
 
-(Joining needs level 20, so level up 19 times first.) To reach it from other machines, give it a
-name they resolve and list it: `PUBLIC_HOSTS="localhost, tournament.example"`. Clients connecting
-by bare IP send no server name, so TLS needs a hostname. For a real domain, remove `local_certs`
-from the [Caddyfile](monitoring/caddy/Caddyfile) and Caddy fetches a public certificate.
+The calls in the tour above work the same way with `--cacert certs/caddy-root.crt`. To reach it
+from other machines, give it a name they resolve and list it:
+`PUBLIC_HOSTS="localhost, tournament.example"`. Clients connecting by bare IP send no server name,
+so TLS needs a hostname. For a real domain, remove `local_certs` from the
+[Caddyfile](monitoring/caddy/Caddyfile) and Caddy fetches a public certificate.
 
 From an IDE (JDK 21), start the backing services, take Elasticsearch's CA certificate out of
 its volume, and point the app at them:
@@ -374,24 +387,26 @@ docker run --rm -i --network tournament-service_default -v "$PWD/load-test":/loa
   grafana/k6:latest run -e BASE_URL=http://app:8080 /load-test/k6.js
 ```
 
-The script signs up its players and sends each one's token. Results from 2026-11-12, each run on a
-fresh stack, on an Apple M1 laptop (8 cores, 8 GB) whose Docker Desktop VM (8 CPUs, 4 GB) ran the
-app, Postgres, Redis, Elasticsearch and k6. Both runs had 0 failed requests, and afterwards every
-group board and the country board in Redis matched Postgres exactly.
+The script signs up its players and sends each one's token. Results from 2026-11-12 on an Apple M1
+laptop (8 cores, 8 GB) whose Docker Desktop VM (8 CPUs, 4 GB) also ran k6, each run on a fresh stack.
+Only the app, Postgres and Redis were running; Elasticsearch, Prometheus, Grafana and Caddy were stopped.
+Both runs sent their full rate with 0 failed requests, and afterwards every group board and the
+country board in Redis matched Postgres exactly. 1,000 requests/s is the highest rate tried that k6
+held without skipping a request; at 1,250 to 1,500 it fell behind during latency spikes.
 
 | 400 requests/s for 60 s | p50 | p90 | p99 |
 |---|---|---|---|
-| Level up | 1.7 ms | 7.4 ms | 159.2 ms |
-| Group leaderboard | 1.3 ms | 4.9 ms | 114.5 ms |
-| Rank | 1.1 ms | 4.6 ms | 141.2 ms |
-| Country leaderboard | 0.4 ms | 2.1 ms | 163.4 ms |
+| Level up | 1.5 ms | 2.2 ms | 8.0 ms |
+| Group leaderboard | 0.9 ms | 1.5 ms | 5.0 ms |
+| Rank | 0.8 ms | 1.3 ms | 3.8 ms |
+| Country leaderboard | 0.3 ms | 0.6 ms | 2.0 ms |
 
-| 1,500 requests/s for 30 s (k6 reached 1,350/s) | p50 | p90 | p99 |
+| 1,000 requests/s for 30 s | p50 | p90 | p99 |
 |---|---|---|---|
-| Level up | 22.1 ms | 375.0 ms | 872.5 ms |
-| Group leaderboard | 14.1 ms | 419.2 ms | 956.5 ms |
-| Rank | 14.1 ms | 409.4 ms | 887.4 ms |
-| Country leaderboard | 4.7 ms | 148.0 ms | 478.7 ms |
+| Level up | 1.8 ms | 12.0 ms | 121.5 ms |
+| Group leaderboard | 1.1 ms | 8.2 ms | 133.2 ms |
+| Rank | 1.0 ms | 7.4 ms | 152.5 ms |
+| Country leaderboard | 0.4 ms | 3.1 ms | 87.1 ms |
 
 ## Known limits
 
