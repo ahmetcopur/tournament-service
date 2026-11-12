@@ -5,7 +5,7 @@ tournament in groups of five (one player per country), and compete on live group
 leaderboards.
 
 Java 21 · Spring Boot 3.5 · Spring Data JPA · PostgreSQL 16 · Redis 7 · Elasticsearch 8 · Flyway ·
-Docker Compose · JUnit 5 + Testcontainers · k6 · Actuator + Prometheus
+Docker Compose · JUnit 5 + Testcontainers · k6 · Actuator, Prometheus and Grafana
 
 ## Run it
 
@@ -30,6 +30,9 @@ docker compose up -d postgres redis elasticsearch
 
 Postgres is published on host port **5433** so it doesn't clash with a local Postgres.
 Elasticsearch runs with security off, which is fine on a laptop and nowhere else.
+
+With the full stack up, the Grafana dashboard is at <http://localhost:3000> (it's the home
+page; anyone can view, `admin`/`admin` can edit) and Prometheus at <http://localhost:9090>.
 
 A quick tour:
 
@@ -56,7 +59,7 @@ curl -s -XPOST localhost:8080/tournaments/current/entries -H 'Content-Type: appl
 | GET | `/groups/{groupId}/leaderboard` | | `[{userId, username, country, score}]` |
 | GET | `/tournaments/{id}/users/{userId}/rank` | | `{rank}` inside the user's group |
 | GET | `/tournaments/{id}/countries/leaderboard` | | `[{country, score}]` |
-| GET | `/tournaments/current` | | `{id, startsAt, endsAt, status, open}` *(added)* |
+| GET | `/tournaments/current` | | `{id, startsAt, endsAt, status, open}`; creates today's row if needed *(added)* |
 | GET | `/users/search?q=ahm&country=TR&limit=20` | | `[User]`, best match first *(added)* |
 
 | Code | HTTP | When |
@@ -73,8 +76,7 @@ curl -s -XPOST localhost:8080/tournaments/current/entries -H 'Content-Type: appl
 | `VALIDATION_ERROR` | 400 | *(added)* Bad body, path or query |
 | `SEARCH_UNAVAILABLE` | 503 | *(added)* Elasticsearch can't be reached; everything else still works |
 
-Metrics: `GET /actuator/prometheus` (HTTP latency histograms, plus
-`leaderboard_redis_write_failures_total` and `search_index_failures_total`).
+Metrics are at `GET /actuator/prometheus`; see [Monitoring](#monitoring).
 
 ## Game rules
 
@@ -151,6 +153,45 @@ value: `score × 10^9 + (10^9 − 1 − ms since tournament start)`. A higher sc
 with equal scores the earlier time wins, matching the 20:00 ranking in Postgres
 ([LeaderboardScore](src/main/java/com/example/tournament/leaderboard/LeaderboardScore.java)).
 
+## Monitoring
+
+Docker Compose runs Prometheus (scraping the app every 5 s) and Grafana with a provisioned
+dashboard, [tournament-service.json](monitoring/grafana/dashboards/tournament-service.json).
+
+![Grafana dashboard under load](docs/grafana-dashboard.jpg)
+
+- **Traffic:** requests per second, p50 and p99 latency per endpoint, and errors per second by
+  API error code. HTTP metrics only show "409"; `api_errors_total{code}` shows which rule said no.
+- **Game:** level-ups against points actually scored (only players in full groups score), joins
+  against groups filled, and a matchmaking gauge: waiting groups and the players stuck in them. A
+  growing waiting count means one country is short of players. Also refunds and reward claims.
+- **Dependencies:** the Postgres connection pool (active, idle, **pending**), Redis command
+  latency, Redis write failures, search index failures, country board rebuilds, and JVM heap.
+
+Metrics the app adds on top of Spring Boot's HTTP, JVM, pool and Redis client metrics:
+
+| Metric | Meaning |
+|---|---|
+| `api_errors_total{code}` | Error responses by code; every code starts at 0 so the first one shows in `rate()` |
+| `game_points_scored_total` | Level-ups that scored a point, counted after commit |
+| `game_groups_filled_total` | Groups that reached five players |
+| `game_refunds_total` | Entries refunded at 20:00 |
+| `game_groups{status}`, `game_players_waiting` | Groups and waiting players in open tournaments, refreshed every 10 s (never queried per scrape) |
+| `leaderboard_redis_write_failures_total` | Redis writes that failed after the Postgres commit |
+| `leaderboard_country_rebuilds_total` | Country boards rebuilt from Postgres: one per tournament start and per 20:00 is normal |
+| `search_index_failures_total` | Players not written to Elasticsearch (the reconcile job retries) |
+
+Building the dashboard turned up three things:
+- **Startup race:** a fresh instance could report healthy while today's tournament row didn't
+  exist yet, so `/tournaments/current` briefly returned 404. That endpoint now creates the row,
+  and tournament startup runs before the search reconcile.
+- **A wasted rebuild:** startup rebuilt an empty country board that the first full group then
+  threw away and rebuilt.
+- **What a stall looks like:** in the screenshot run, a 228 ms garbage-collection pause on an
+  overloaded laptop backed up 128 requests waiting for a pool connection and timed out two Redis
+  writes. Both failures were counted, Postgres stayed correct, and the next update for each
+  player repaired the boards.
+
 ## Where this differs from the design doc, and why
 
 1. **Re-check after the lock in matchmaking.** The candidate query's `NOT EXISTS` runs on a
@@ -197,16 +238,20 @@ with equal scores the earlier time wins, matching the 20:00 ranking in Postgres
 ./mvnw test        # needs Docker for Testcontainers
 ```
 
-47 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
-Postgres, Redis (in cluster mode) and Elasticsearch containers:
+52 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
+Postgres, Redis (in cluster mode) and Elasticsearch containers. CI (GitHub Actions) runs them on
+every pull request and checks that the Docker image builds.
 
 - **Users:** create, duplicate name, validation, level up.
 - **Joining:** each entry rule and error code, group fill to `ACTIVE`, same country going to
-  another group, score counting only once the group is full.
+  another group, score counting only once the group is full, today's tournament existing on the
+  first read.
 - **Leaderboards:** order with tie-break, rank, country sums, Redis wipe recovery, key expiry.
 - **Country board exactness:** retried and out-of-order updates, late updates after a wipe, reads
-  while another instance rebuilds, half a board evicted, and 600 concurrent level ups with Redis
-  wiped halfway (the board still equals the Postgres sums).
+  while another instance rebuilds, half a board evicted, no empty board at startup, and 600
+  concurrent level ups with Redis wiped halfway (the board still equals the Postgres sums).
+- **Metrics:** error codes counted, points and filled groups counted only for real events,
+  waiting-group gauges, refunds.
 - **End of day:** ranks, rewards, refunds of the fee actually paid, idempotency, no points after
   20:00, claims (including 10 concurrent claims paying once), unclaimed reward blocking the next
   day.

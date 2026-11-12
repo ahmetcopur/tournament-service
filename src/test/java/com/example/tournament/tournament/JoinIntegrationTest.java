@@ -1,6 +1,7 @@
 package com.example.tournament.tournament;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -101,6 +102,17 @@ class JoinIntegrationTest extends IntegrationTestBase {
         join(player).andExpect(status().isConflict())
                 .andExpect(jsonPath("$.code").value("UNCLAIMED_REWARD"));
         assertThat(coins(player)).isEqualTo(5000);
+    }
+
+    @Test
+    void currentTournamentExistsEvenBeforeStartupOrMidnightCreatedIt() throws Exception {
+        // No tournament row at all, like a fresh instance before its startup tasks ran.
+        JsonNode first = body(mvc.perform(get("/tournaments/current")).andExpect(status().isOk()));
+        assertThat(first.get("open").asBoolean()).isTrue();
+        assertThat(first.get("endsAt").asText()).isEqualTo(CLOSING_TIME.toString());
+
+        mvc.perform(get("/tournaments/current")).andExpect(jsonPath("$.id").value(first.get("id").asLong()));
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM tournaments", Integer.class)).isEqualTo(1);
     }
 
     @Test

@@ -58,6 +58,7 @@ public class LeaderboardWriter {
     private final GameProperties props;
     private final TransactionTemplate readTx;
     private final Counter failures;
+    private final Counter countryRebuilds;
     private final RedisScript<Long> upsertGroupScript =
             RedisScript.of(new ClassPathResource("redis/upsert_group.lua"), Long.class);
     private final RedisScript<Long> countryApplyScript =
@@ -82,6 +83,9 @@ public class LeaderboardWriter {
         this.readTx.setReadOnly(true);
         this.failures = Counter.builder("leaderboard.redis.write.failures")
                 .description("Redis leaderboard writes that failed after the Postgres commit")
+                .register(meters);
+        this.countryRebuilds = Counter.builder("leaderboard.country.rebuilds")
+                .description("Country boards rebuilt from Postgres (start of a tournament, Redis data loss, 20:00)")
                 .register(meters);
     }
 
@@ -196,6 +200,12 @@ public class LeaderboardWriter {
             List<Contribution> all = readTx.execute(status -> members.findInStartedGroups(tournamentId)).stream()
                     .map(m -> new Contribution(m.getUserId(), m.getCountry(), m.getScore()))
                     .toList();
+            if (all.isEmpty()) {
+                // No full group yet, so no board. Marking an empty board complete would only be
+                // thrown away by the first group's update (it finds the totals key missing).
+                return;
+            }
+            countryRebuilds.increment();
             for (int from = 0; from < all.size(); from += APPLY_BATCH) {
                 applyToCountryBoard(tournamentId, end, all.subList(from, Math.min(from + APPLY_BATCH, all.size())), false);
             }

@@ -1,6 +1,7 @@
 package com.example.tournament.tournament;
 
 import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
@@ -38,4 +39,14 @@ public interface TournamentGroupRepository extends JpaRepository<TournamentGroup
             WHERE tournament_id = :tournamentId AND status <> 'ENDED'
             """, nativeQuery = true)
     int endAll(@Param("tournamentId") long tournamentId);
+
+    /** Per status in open tournaments: [status, groups, players]. Feeds the matchmaking gauges. */
+    @Query(value = """
+            SELECT g.status, count(*), coalesce(sum(g.member_count), 0)
+            FROM tournament_groups g
+            JOIN tournaments t ON t.id = g.tournament_id
+            WHERE t.status = 'ACTIVE'
+            GROUP BY g.status
+            """, nativeQuery = true)
+    List<Object[]> statsForOpenTournaments();
 }

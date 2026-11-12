@@ -6,6 +6,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import com.example.tournament.leaderboard.LeaderboardEvents.ScoreChanged;
 import com.example.tournament.support.IntegrationTestBase;
 import com.example.tournament.tournament.Tournament;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -24,6 +25,8 @@ class CountryBoardIntegrationTest extends IntegrationTestBase {
 
     @Autowired
     private LeaderboardWriter writer;
+    @Autowired
+    private MeterRegistry meters;
 
     private Map<String, Long> postgresTotals(long tournamentId) {
         Map<String, Long> totals = new TreeMap<>();
@@ -154,6 +157,19 @@ class CountryBoardIntegrationTest extends IntegrationTestBase {
         assertThat(postgresTotals(t.getId()).values().stream().mapToLong(Long::longValue).sum()).isEqualTo(total);
         assertThat(complete(t.getId())).isTrue();
         assertThat(redisTotals(t.getId())).isEqualTo(postgresTotals(t.getId()));
+    }
+
+    @Test
+    void startupWithNoFullGroupBuildsNothingAndTheFirstGroupBuildsOnce() throws Exception {
+        Tournament t = openTournament();
+        double rebuildsBefore = meters.counter("leaderboard.country.rebuilds").count();
+
+        writer.rebuildIfMissing(t.getId()); // what startup does
+        assertThat(redis.hasKey(LeaderboardKeys.countryApplied(t.getId()))).isFalse();
+
+        fullGroup();
+        assertThat(complete(t.getId())).isTrue();
+        assertThat(meters.counter("leaderboard.country.rebuilds").count() - rebuildsBefore).isEqualTo(1);
     }
 
     @Test

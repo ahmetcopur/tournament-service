@@ -1,5 +1,7 @@
 package com.example.tournament.common;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.util.stream.Collectors;
 import org.hibernate.exception.ConstraintViolationException;
 import org.slf4j.Logger;
@@ -21,6 +23,17 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    private final MeterRegistry meters;
+
+    public GlobalExceptionHandler(MeterRegistry meters) {
+        this.meters = meters;
+        // Start every code at 0. A counter that first appears at 1 has no earlier sample, so
+        // Prometheus' rate() would never show that first error.
+        for (ErrorCode code : ErrorCode.values()) {
+            counter(code.name());
+        }
+    }
 
     @ExceptionHandler(ApiException.class)
     ResponseEntity<ApiError> handleApi(ApiException ex) {
@@ -70,14 +83,29 @@ public class GlobalExceptionHandler {
     ResponseEntity<ApiError> handleOther(Exception ex) {
         if (ex instanceof ErrorResponse er) {
             HttpStatusCode status = er.getStatusCode();
-            return ResponseEntity.status(status).body(new ApiError("HTTP_" + status.value(), ex.getMessage()));
+            String code = "HTTP_" + status.value();
+            count(code);
+            return ResponseEntity.status(status).body(new ApiError(code, ex.getMessage()));
         }
         log.error("Unhandled error", ex);
         return respond(ErrorCode.INTERNAL_ERROR, ErrorCode.INTERNAL_ERROR.defaultMessage());
     }
 
-    private static ResponseEntity<ApiError> respond(ErrorCode code, String message) {
+    private ResponseEntity<ApiError> respond(ErrorCode code, String message) {
+        count(code.name());
         return ResponseEntity.status(code.status()).body(ApiError.of(code, message));
+    }
+
+    /** api_errors_total{code=...}: HTTP metrics only show 409, this shows which rule said no. */
+    private void count(String code) {
+        counter(code).increment();
+    }
+
+    private Counter counter(String code) {
+        return Counter.builder("api.errors")
+                .description("Error responses by error code")
+                .tag("code", code)
+                .register(meters);
     }
 
     private static String constraintName(Throwable ex) {
