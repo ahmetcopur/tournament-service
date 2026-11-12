@@ -24,29 +24,38 @@ TOURNAMENT_CLOSES_AT=24h docker compose up --build
 Secrets come from a git-ignored `.env` file; [.env.example](.env.example) lists them with
 local-only defaults. Set real values anywhere other than a laptop, above all `AUTH_TOKEN_SECRET`.
 
-Only the API is published to the network. Everything else is bound to `127.0.0.1`, because in
-Compose Postgres uses development credentials, Redis has no password, and Grafana allows anonymous
-viewing. In a real deployment, don't publish those ports at all.
+The network reaches the API only over HTTPS, through Caddy on port 8443; bearer tokens never cross
+the network in clear. Caddy ends TLS and forwards to the app inside the Docker network, as a load
+balancer would. Everything else is bound to `127.0.0.1`, because in Compose Postgres uses
+development credentials, Redis has no password, and Grafana allows anonymous viewing. In a real
+deployment, don't publish those ports at all.
 
 | Port | What | Reachable from |
 |---|---|---|
-| 8080 | The API (every call but sign up needs a token) | the network |
+| 8443 | The API over HTTPS (Caddy); every call but sign up needs a token | the network |
+| 8080 | The API over plain HTTP, for local tools (k6, curl) | this machine only |
 | 8081 | Actuator: health, metrics, Prometheus | this machine only |
 | 3000 / 9090 | Grafana dashboard (home page; `admin`/`admin` edits) / Prometheus | this machine only |
 | 9200 | Elasticsearch, HTTPS with a password | this machine only |
 | 5433 / 6379 | Postgres (5433 so it doesn't clash with a local one) / Redis | this machine only |
 
-A quick tour. Sign up returns a token; every other request sends it.
+Caddy signs its certificates with its own local CA. Take its root once, then call the API the
+way clients do, over HTTPS. Sign up returns a token; every other request sends it.
 
 ```bash
-TOKEN=$(curl -s -XPOST localhost:8080/users -H 'Content-Type: application/json' -d '{"username":"alice"}' | jq -r .token)
-curl -s -XPOST localhost:8080/users/1/levels -H "Authorization: Bearer $TOKEN"
-curl -s localhost:8080/tournaments/current -H "Authorization: Bearer $TOKEN"
-curl -s -XPOST localhost:8080/tournaments/current/entries -H "Authorization: Bearer $TOKEN" \
+mkdir -p certs && docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt certs/caddy-root.crt
+API="curl -s --cacert certs/caddy-root.crt https://localhost:8443"
+TOKEN=$($API/users -XPOST -H 'Content-Type: application/json' -d '{"username":"alice"}' | jq -r .token)
+$API/users/1/levels -XPOST -H "Authorization: Bearer $TOKEN"
+$API/tournaments/current -H "Authorization: Bearer $TOKEN"
+$API/tournaments/current/entries -XPOST -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' -d '{"userId":1}'
 ```
 
-(Joining needs level 20, so level up 19 times first.)
+(Joining needs level 20, so level up 19 times first.) To reach it from other machines, give it a
+name they resolve and list it: `PUBLIC_HOSTS="localhost, tournament.example"`. Clients connecting
+by bare IP send no server name, so TLS needs a hostname. For a real domain, remove `local_certs`
+from the [Caddyfile](monitoring/caddy/Caddyfile) and Caddy fetches a public certificate.
 
 From an IDE (JDK 21), start the backing services, take Elasticsearch's CA certificate out of
 its volume, and point the app at them:
@@ -187,10 +196,12 @@ or losing one.
   lock that expires). It sends only scores changed and groups filled since its previous run, plus a
   minute of margin; the first run, or one after Redis lost data, does everything. A timeout doesn't
   even mean the write was lost: it can land late, and the retry applying it again changes nothing.
-- At 20:00 and at startup, boards are rebuilt from Postgres. A successful final rebuild is recorded
-  in `tournaments.boards_finalized_at`. If it fails (Redis down at 20:00, or the instance dies), the
-  tournament stays unfinalized and the 5-minute job retries it until it succeeds, for as long as its
-  boards would still exist. Only those tournaments are retried, never the whole history.
+- At 20:00 and at startup, boards are rebuilt from Postgres. Finalization rebuilds the boards,
+  deletes the bookkeeping, and only then records `tournaments.boards_finalized_at`, so the marker
+  means "rebuilt and cleaned up". If any step fails (Redis down at 20:00, the instance dies part
+  way), the marker stays empty and the 5-minute job retries the whole thing until it succeeds, for
+  as long as the boards would still exist. Only those tournaments are retried, never the whole
+  history.
 
 **Redis Cluster.** Every command touches one key, or keys sharing a hash tag: a country board
 slice `lb:country:{t7:s3/8}` and its bookkeeping (`…:meta`, `…:b<n>`) sit in one slot, so the
@@ -336,7 +347,10 @@ The known limits from the previous version, and what closed each one:
 | One hot country key | 8 slices with their own hash tags, summed on read (cached 1 s) | Five players land in five slices; the API total equals Postgres |
 | Bookkeeping ~50 B/player, kept 2 days | 100-player hashes in compact encoding, deleted when final | 6.8 vs 48.3 bytes per player; 0 after 20:00 |
 | Elasticsearch security off | TLS with its own CA, a password, and a least-privilege app user | Against Compose: plain HTTP refused; no credentials 401; the app user gets 403 on other indices |
-| Internal ports open to the network | Postgres, Redis, Prometheus, Grafana, Elasticsearch and actuator bound to `127.0.0.1` | From the machine's network address only 8080 answers; the rest are unreachable |
+| Internal ports open to the network | Postgres, Redis, Prometheus, Grafana, Elasticsearch, actuator and the app's plain HTTP bound to `127.0.0.1` | From the machine's network address all of them are unreachable |
+| API over plain HTTP | Caddy in front: HTTPS only (TLS 1.3), the only public port | Over the network by hostname: verified certificate, 401 without a token; plain HTTP to the port is refused |
+| Elasticsearch's private key readable by the app | Keys `600` (the CA key root-only), archives deleted, the app mounts a volume with only the CA certificate | Before: user 1001 could read `elasticsearch.key`. After: neither key readable; the app sees only `ca.crt` |
+| Finalization cleanup not retried | Clean up first, record the Postgres marker last | Redis fails during cleanup: the tournament stays unfinalized, and the retry finishes the cleanup |
 
 ## Tests
 
@@ -344,7 +358,7 @@ The known limits from the previous version, and what closed each one:
 ./mvnw test        # needs Docker for Testcontainers
 ```
 
-75 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
+76 tests: unit tests for the tie-break encoding and level up, plus integration tests against real
 Postgres, Redis (in cluster mode) and Elasticsearch containers. CI (GitHub Actions) runs them on
 every pull request and checks that the Docker image builds.
 
@@ -359,7 +373,7 @@ every pull request and checks that the Docker image builds.
   rank, country sums, Redis wipe recovery, key expiry.
 - **Redis repair:** writes that fail are re-applied from Postgres; writes that time out but land
   late aren't counted twice; the periodic re-apply repairs updates Redis never heard about, and
-  finishes a final rebuild that failed at 20:00.
+  finishes a final rebuild, or its cleanup, that failed at 20:00.
 - **Country board exactness:** retried and out-of-order updates, late updates after a wipe, reads
   while another instance rebuilds, half a board evicted, no empty board at startup, and 600
   concurrent level ups with Redis wiped halfway (the board still equals the Postgres sums).
@@ -433,8 +447,9 @@ These are fine for a demo and must be decided before real players use it.
   identity provider, use its public keys (RS256/ES256) so the API can only verify.
 - **Redis must not evict** (`maxmemory-policy noeviction`, the default). Losing a slice's totals or
   metadata is detected and rebuilt; losing a single bookkeeping hash on its own is not.
-- **Postgres and Redis run without TLS or a Redis password** in Compose. Fine on one machine;
-  anywhere else, use managed services or turn both on.
+- **Postgres and Redis run without TLS or a Redis password** in Compose, and inside the Docker
+  network the app speaks plain HTTP behind Caddy. Fine on one machine or a private network;
+  anywhere else, use managed services or turn TLS on for each hop.
 - **The search checksum is probabilistic, and still scans the users table.** A missing or extra
   document always changes a range's count, so it is always found. A document with the right id
   but the wrong name changes the fingerprint sum unless its 31-bit fingerprint happens to equal

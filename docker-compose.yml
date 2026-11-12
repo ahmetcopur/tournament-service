@@ -39,6 +39,7 @@ services:
       ES_APP_PASSWORD: ${ES_APP_PASSWORD:-app-local-only}
     volumes:
       - escerts:/usr/share/elasticsearch/config/certs
+      - es-ca:/ca-public
       - ./monitoring/elasticsearch/setup.sh:/setup.sh:ro
     command: ["bash", "/setup.sh"]
     healthcheck:
@@ -88,13 +89,14 @@ services:
       SPRING_ELASTICSEARCH_USERNAME: tournament_app
       SPRING_ELASTICSEARCH_PASSWORD: ${ES_APP_PASSWORD:-app-local-only}
       SPRING_ELASTICSEARCH_RESTCLIENT_SSL_BUNDLE: elasticsearch
-      SPRING_SSL_BUNDLE_PEM_ELASTICSEARCH_TRUSTSTORE_CERTIFICATE: file:/certs/ca/ca.crt
+      SPRING_SSL_BUNDLE_PEM_ELASTICSEARCH_TRUSTSTORE_CERTIFICATE: file:/certs/ca.crt
       # Set TOURNAMENT_CLOSES_AT=24h to play or load test after 20:00 UTC.
       TOURNAMENT_CLOSES_AT: ${TOURNAMENT_CLOSES_AT:-20h}
     volumes:
-      - escerts:/certs:ro
+      - es-ca:/certs:ro   # only the CA certificate; no private keys
     ports:
-      - "${APP_PORT:-8080}:8080"   # the API, the one public port; every call but sign up needs a token
+      # Plain HTTP for local tools only. The network reaches the API through caddy, over HTTPS.
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
       # Actuator (health, metrics) is on 8081. Published to this machine only; never publicly.
       - "127.0.0.1:${MANAGEMENT_PORT:-8081}:8081"
     depends_on:
@@ -106,6 +108,19 @@ services:
         condition: service_healthy
       es-setup:
         condition: service_completed_successfully
+
+  # The only public entry point: HTTPS, terminated here and proxied to the app.
+  caddy:
+    image: caddy:2.11.6-alpine
+    environment:
+      PUBLIC_HOSTS: ${PUBLIC_HOSTS:-localhost}
+    volumes:
+      - ./monitoring/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data   # keeps its local CA, so clients can keep trusting it
+    ports:
+      - "${HTTPS_PORT:-8443}:443"
+    depends_on:
+      - app
 
   prometheus:
     image: prom/prometheus:v3.15.1
@@ -140,3 +155,5 @@ services:
 volumes:
   pgdata:
   escerts:
+  es-ca:
+  caddy-data:

@@ -342,21 +342,22 @@ public class LeaderboardWriter {
     }
 
     /**
-     * Rebuilds a finished tournament's boards, records that in Postgres, then deletes the country
-     * board's bookkeeping: once scores can't change it is dead weight, so it lives for the
-     * tournament's day instead of the boards' two-day TTL. Returns false (and records nothing) if
-     * another instance is rebuilding right now.
+     * Rebuilds a finished tournament's boards, deletes the country board's bookkeeping (once scores
+     * can't change it is dead weight, so it lives for the tournament's day instead of the boards'
+     * two-day TTL), and only then records the tournament as finalized in Postgres.
+     *
+     * <p>That order makes the Postgres marker mean "rebuilt and cleaned up". If anything fails or
+     * the instance dies part way, the marker stays empty and {@link #reapplyTournaments()} runs
+     * the whole thing again, which is harmless: the rebuild skips slices already marked final, and
+     * deleting keys that are gone does nothing. Errors propagate so the caller logs and retries.
+     * Returns false (and records nothing) if another instance is rebuilding right now.
      */
     private boolean finalizeBoards(long tournamentId) {
         Map<Integer, Set<Long>> buckets = rebuildBoards(tournamentId, true);
         if (buckets == null) {
             return false;
         }
-        writeTx.executeWithoutResult(status -> tournaments.markBoardsFinalized(tournamentId, time.now()));
-        if (buckets.isEmpty()) {
-            return true; // no full group ever: no board to finalize
-        }
-        try {
+        if (!buckets.isEmpty()) { // no full group ever means no board to clean up
             Instant expiry = Instant.ofEpochSecond(expireAt(windows.of(tournamentId).endsAt()));
             for (int shard = 0; shard < layout.shards(); shard++) {
                 // Final first: from now on the slice ignores updates, so nothing touches the buckets.
@@ -370,10 +371,8 @@ public class LeaderboardWriter {
                     redis.delete(keys.subList(from, Math.min(from + APPLY_BATCH, keys.size())));
                 }
             });
-        } catch (RuntimeException ex) {
-            // The board is final and exact; the leftover bookkeeping just expires with its TTL.
-            log.warn("Could not delete the country board bookkeeping of tournament {}: {}", tournamentId, ex.getMessage());
         }
+        writeTx.executeWithoutResult(status -> tournaments.markBoardsFinalized(tournamentId, time.now()));
         return true;
     }
 

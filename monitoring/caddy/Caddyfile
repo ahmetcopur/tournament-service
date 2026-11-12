@@ -1,0 +1,15 @@
+# The public entry point: HTTPS only. TLS ends here; inside the Docker network the app speaks
+# plain HTTP, as it would behind a load balancer. Bearer tokens never cross the network in clear.
+{
+	# Local development: certificates from Caddy's own CA (trust its root, or curl --cacert).
+	# For a real domain, remove this line: Caddy then gets a public certificate (Let's Encrypt),
+	# and you should add Strict-Transport-Security below. (Not here: HSTS on "localhost" would
+	# force HTTPS on every localhost port in your browser, Grafana included.)
+	local_certs
+}
+
+# PUBLIC_HOSTS: the names (or IPs) clients use, comma separated, e.g. "localhost, 192.168.1.130".
+{$PUBLIC_HOSTS:localhost} {
+	reverse_proxy app:8080
+	header -Server
+}
